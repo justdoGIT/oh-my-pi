@@ -12,6 +12,8 @@
  *     marker naming the live omp process; a
  *     sandbox whose owner is still running is reported `live` and never
  *     removed without `--all`, so `clear` reclaims only crashed leftovers.
+ *     An ovnfs-backed sandbox has no `m`; its record names the ovnfs checkout,
+ *     which `clear` removes first (`task/ovnfs.ts`).
  *
  * Legacy entries from before the encoding change keep working because git still
  * tracks them by branch name. This command exists to GC them on demand.
@@ -24,7 +26,10 @@ import { getWorktreesDir, isEnoent } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Settings } from "../config/settings";
 import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend } from "../task/isolation-ownership";
+import { releaseOvnfsCheckout } from "../task/ovnfs";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
+
+import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
 
 type WorktreeKind = "pr-checkout" | "task-isolation" | "empty" | "stray";
 
@@ -147,8 +152,8 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	}
 	const result = await repository.worktreeAdd(worktreePath, ref, {
 		detach,
-		clone: settings.get("worktree.clone"),
-		backend: parseIsolationBackend(settings.get("isolation.backend")),
+		clone: cfgWorktreeClone.get(settings),
+		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
 	});
 	if (!options.quiet) {
 		console.log(`HEAD is now at ${shortSha} ${subject}`);
@@ -159,6 +164,10 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	if (result.cloneError) {
 		console.error(chalk.dim(`warning: worktree clone fell back to plain checkout: ${result.cloneError}`));
 	}
+	const hook = await vcs.runPostCheckoutHook(worktreePath, commit.sha);
+	process.stderr.write(hook.stdout);
+	process.stderr.write(hook.stderr);
+	if (hook.exitCode !== 0) process.exitCode = hook.exitCode;
 }
 
 export async function listWorktrees(options: ListWorktreesOptions): Promise<void> {
@@ -184,7 +193,7 @@ export async function listWorktrees(options: ListWorktreesOptions): Promise<void
 	console.log(chalk.dim(`\n${live} live · ${orphaned} orphaned · ${entries.length} total`));
 }
 
-export async function clearWorktrees(options: ClearWorktreesOptions): Promise<void> {
+export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{ removed: number; failed: number }> {
 	const entries = await scanWorktrees();
 	const targets = options.all ? entries : entries.filter(entry => entry.orphanReason !== undefined);
 
@@ -194,7 +203,7 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<vo
 		} else {
 			console.log(chalk.dim(options.all ? "No worktrees to remove." : "No orphaned worktrees to remove."));
 		}
-		return;
+		return { removed: 0, failed: 0 };
 	}
 
 	if (options.dryRun) {
@@ -206,7 +215,7 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<vo
 			}
 			console.log(chalk.dim(`\n${targets.length} dir${targets.length === 1 ? "" : "s"} would be removed.`));
 		}
-		return;
+		return { removed: 0, failed: 0 };
 	}
 
 	const results: { path: string; ok: boolean; error?: string }[] = [];
@@ -223,7 +232,10 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<vo
 					parentsToPrune.add(target.parentRepo);
 				}
 			} else {
-				if (target.kind === "task-isolation") await stopRetainedMount(target.path);
+				if (target.kind === "task-isolation") {
+					await stopRetainedMount(target.path);
+					await releaseOvnfsCheckout(target.path);
+				}
 				await fs.rm(target.path, { recursive: true, force: true });
 				if (target.parentRepo) parentsToPrune.add(target.parentRepo);
 			}
@@ -247,8 +259,7 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<vo
 
 	if (options.json) {
 		console.log(JSON.stringify({ removed: succeeded, failed, results }, null, 2));
-		if (failed > 0) process.exitCode = 1;
-		return;
+		return { removed: succeeded, failed };
 	}
 
 	for (const result of results) {
@@ -260,7 +271,7 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<vo
 		}
 	}
 	console.log(chalk.dim(`\n${succeeded} removed${failed > 0 ? ` · ${chalk.red(`${failed} failed`)}` : ""}`));
-	if (failed > 0) process.exitCode = 1;
+	return { removed: succeeded, failed };
 }
 
 // ───────────────────────────────────────────────────────────────────────────

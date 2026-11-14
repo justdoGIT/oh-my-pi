@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { loadMnemopiConfig, type MnemopiBackendConfig } from "@oh-my-pi/pi-coding-agent/mnemopi/config";
@@ -55,6 +56,20 @@ describe("loadMnemopiConfig embedding variant resolution", () => {
 		}
 	});
 
+	it("falls back to MNEMOPI_EMBEDDING_MODEL when the configured model is blank or null", () => {
+		const previous = Bun.env.MNEMOPI_EMBEDDING_MODEL;
+		Bun.env.MNEMOPI_EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5";
+		try {
+			// Clearing the field in the settings panel must not permanently shadow the env model.
+			expect(embeddingModelFor({ "mnemopi.embeddingModel": "" })).toBe("BAAI/bge-large-en-v1.5");
+			expect(embeddingModelFor({ "mnemopi.embeddingModel": "  " })).toBe("BAAI/bge-large-en-v1.5");
+			expect(embeddingModelFor({ "mnemopi.embeddingModel": null })).toBe("BAAI/bge-large-en-v1.5");
+		} finally {
+			if (previous === undefined) delete Bun.env.MNEMOPI_EMBEDDING_MODEL;
+			else Bun.env.MNEMOPI_EMBEDDING_MODEL = previous;
+		}
+	});
+
 	it("lets an explicit embeddingModel setting win over the env var", () => {
 		const previous = Bun.env.MNEMOPI_EMBEDDING_MODEL;
 		Bun.env.MNEMOPI_EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5";
@@ -76,5 +91,19 @@ describe("loadMnemopiConfig database path resolution", () => {
 
 		expect(mnemopiConfigFor({ "mnemopi.dbPath": "" }, agentDir).dbPath).toBe(defaultPath);
 		expect(mnemopiConfigFor({ "mnemopi.dbPath": " \t " }, agentDir).dbPath).toBe(defaultPath);
+	});
+
+	it("expands a leading ~ in dbPath to the home directory", () => {
+		expect(mnemopiConfigFor({ "mnemopi.dbPath": "~/mnemopi/custom.db" }).dbPath).toBe(
+			path.join(os.homedir(), "mnemopi", "custom.db"),
+		);
+		expect(mnemopiConfigFor({ "mnemopi.dbPath": "  ~/custom.db  " }).dbPath).toBe(
+			path.join(os.homedir(), "custom.db"),
+		);
+	});
+
+	it("keeps .. in a configured dbPath, which may follow a symlink", () => {
+		const viaLink = ["", "home", "me", "link", "..", "mnemopi.db"].join(path.sep);
+		expect(mnemopiConfigFor({ "mnemopi.dbPath": viaLink }).dbPath).toBe(viaLink);
 	});
 });

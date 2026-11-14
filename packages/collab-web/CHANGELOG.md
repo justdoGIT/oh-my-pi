@@ -2,6 +2,88 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a web guest going live with the agents, tool cards and working state from before a rejoin when the rejoin's welcome failed to apply; the guest now says hello again within the auto-rejoin budget ([#19182](https://github.com/can1357/oh-my-pi/pull/19182) by [@alphastorm](https://github.com/alphastorm))
+
+## [18.19.0] - 2026-11-12
+
+### Fixed
+
+- Fixed `task` tool cards so spawned tasks consistently display their name, assigned agent, and instructions, with `steps` spawns shown as numbered stages.
+
+## [18.18.8] - 2026-11-11
+
+### Changed
+
+- Ask result cards render saved notes beneath their matching selected answers ([#18779](https://github.com/can1357/oh-my-pi/pull/18779) by [@Shadorain](https://github.com/Shadorain))
+
+## [18.18.3] - 2026-11-09
+
+### Changed
+
+- `ask` tool cards show the HTML form's fieldset legends and field count while pending, and each question with its submitted answer (or "(no answer)") once answered, flagging submissions made by the timeout
+
+## [18.15.0] - 2026-11-01
+
+### Changed
+
+- `job` tool results name each background job by the purpose the model gave for it, falling back to its command ([#17649](https://github.com/can1357/oh-my-pi/pull/17649) by [@wolfiesch](https://github.com/wolfiesch))
+
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
+
+## [18.8.0] - 2026-10-07
+
+### Changed
+
+- Improved streaming transcript performance by reducing unnecessary guest updates and Markdown re-rendering, including faster rendering for transcripts with many unclosed LaTeX delimiters.
+- Stopped tracking finished or no-longer-listed subagents, reducing unnecessary polling and memory usage in the agent drawer.
+
+## [18.4.10] - 2026-10-02
+
+### Fixed
+
+- Fixed long transcript paragraphs slowing Markdown rendering: a 44 KB paragraph with no blank line now parses in about 3 ms instead of 100 ms ([#13961](https://github.com/can1357/oh-my-pi/pull/13961) by [@sjawhar](https://github.com/sjawhar)).
+- Fixed transcript paragraphs with many unclosed `$`, `\(` or `\[`, slowing Markdown rendering for seconds ([#13961](https://github.com/can1357/oh-my-pi/pull/13961) by [@sjawhar](https://github.com/sjawhar)).
+
+## [18.4.1] - 2026-09-28
+
+### Fixed
+
+- Prevented iOS Safari from zooming collab text fields on focus in wide touch viewports, including landscape orientation ([#13371](https://github.com/can1357/oh-my-pi/pull/13371) by [@andersennl](https://github.com/andersennl)).
+
+## [18.4.0] - 2026-09-28
+
+### Changed
+
+- Redesigned the web client: black chassis with one inset session panel, glass top bar with the omp mark and a live status pill, a docked composer card, prompts shown as cards in the transcript, a sectioned agents rail, and a floating agent drawer; the connect screen was rebuilt too
+
+## [18.3.1] - 2026-09-25
+
+### Fixed
+
+- Improved large-session browsing and reconnect behavior: recent transcript entries load quickly, earlier entries can be loaded on demand without losing your place, and the existing transcript remains visible with download progress during reconnects.
+
+## [18.3.0] - 2026-09-24
+
+### Added
+
+- Added support for rendering coordinated job and messaging views through the `wait` tool.
+
+### Removed
+
+- Removed the obsolete `hub` tool renderer.
+
+## [18.2.1] - 2026-09-15
+
+### Fixed
+
+- Browser collab guests now automatically rejoin when a transient host network drop recreates the relay room ([#11858](https://github.com/can1357/oh-my-pi/issues/11858)).
+
 ## [18.1.17] - 2026-09-10
 
 ### Fixed
