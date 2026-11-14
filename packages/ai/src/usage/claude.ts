@@ -1,12 +1,13 @@
-import { scheduler } from "node:timers/promises";
 import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
-import { toNumber } from "@oh-my-pi/pi-catalog/utils";
+import { isAnthropicOAuthToken, toNumber } from "@oh-my-pi/pi-catalog/utils";
+import { slugify } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import {
 	type CredentialRankingContext,
 	type CredentialRankingStrategy,
 	resolveUsedFraction,
 	type UsageAmount,
+	type UsageCredential,
 	type UsageFetchContext,
 	type UsageFetchParams,
 	type UsageLimit,
@@ -15,17 +16,66 @@ import {
 	type UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
+import { waitForRetry } from "../utils/retry-wait";
 import { buildClaudeOAuthHeaders, claudeOAuthBaseUrls } from "./claude-api";
 import { listClaudeResetCredits, parseClaudeResetCreditsFromUsagePayload } from "./claude-reset";
 import { HOUR_MS, parseIsoTimestamp, usageStatus, WEEK_MS } from "./shared";
 
 const MAX_ATTEMPTS = 3;
 const BASE_RETRY_DELAY_MS = 500;
-/** Shared windows that gate every Claude request, whatever the model. */
-const CLAUDE_SHARED_GATE_WINDOW_IDS = ["5h", "7d"] as const;
+/** `/usage` stays rate-limited for minutes after a 429, so a failed refresh waits instead of re-polling. */
+const FAILURE_BACKOFF_MS = 60_000;
+/**
+ * Shared windows that gate every Claude request, whatever the model, with the
+ * legacy bucket field and the `limits[]` kind that report each one.
+ */
+const CLAUDE_SHARED_GATES = {
+	"5h": { field: "five_hour", kind: "session" },
+	"7d": { field: "seven_day", kind: "weekly_all" },
+} as const;
+const CLAUDE_SHARED_GATE_WINDOW_IDS = Object.keys(CLAUDE_SHARED_GATES) as (keyof typeof CLAUDE_SHARED_GATES)[];
+/** Report metadata key listing shared gates the live payload declared inactive. */
+const INACTIVE_SHARED_GATES_KEY = "inactiveSharedGates";
+
+/**
+ * Shared gates the payload positively declares inactive: the bucket field is
+ * present and `null`, and the authoritative `limits[]` list carries no row of
+ * that kind. Anthropic answers `five_hour: null` with no `session` row while an
+ * account has no running 5-hour window, so that gate cannot be what blocks it.
+ * A missing field or a payload without `limits[]` proves nothing.
+ */
+function declaredInactiveSharedGates(payload: Record<string, unknown>): string[] {
+	const listed = payload.limits;
+	if (!Array.isArray(listed)) return [];
+	return CLAUDE_SHARED_GATE_WINDOW_IDS.filter(windowId => {
+		const { field, kind } = CLAUDE_SHARED_GATES[windowId];
+		return (
+			Object.hasOwn(payload, field) &&
+			payload[field] === null &&
+			!listed.some(entry => isRecord(entry) && entry.kind === kind)
+		);
+	});
+}
+
+/**
+ * Whether a report accounts for every shared gate: each one either reported a
+ * window or was declared inactive by the live payload. Healing and reset
+ * clearing judge account-wide blocks only from such complete reports.
+ */
+export function claudeReportCoversSharedGates(report: UsageReport): boolean {
+	const inactive = report.metadata?.[INACTIVE_SHARED_GATES_KEY];
+	return CLAUDE_SHARED_GATE_WINDOW_IDS.every(
+		windowId =>
+			report.limits.some(
+				limit =>
+					limit.scope.shared === true && (limit.scope.windowId === windowId || limit.window?.id === windowId),
+			) ||
+			(Array.isArray(inactive) && inactive.includes(windowId)),
+	);
+}
 
 const CLAUDE_USAGE_BETAS =
-	"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+	"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
 
 interface ClaudeUsageBucket {
 	utilization?: number;
@@ -237,11 +287,7 @@ async function waitBeforeRetry(
 	if (attempt >= MAX_ATTEMPTS - 1) return false;
 	try {
 		const delayMs = retryDelayMs(attempt, retryAfter);
-		if (retryWait) {
-			await retryWait(delayMs, signal);
-		} else {
-			await scheduler.wait(delayMs, { signal });
-		}
+		await waitForRetry(retryWait, delayMs, signal);
 		return !signal?.aborted;
 	} catch (error) {
 		if (isAbortError(error, signal)) return false;
@@ -546,14 +592,6 @@ function buildUsageLimit(args: {
 	};
 }
 
-function slugifyClaudeLimitDisplayName(displayName: string): string {
-	return displayName
-		.trim()
-		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "-")
-		.replace(/^-+|-+$/g, "");
-}
-
 /**
  * Scoped weekly rows are per-model-family counters, not account-wide windows.
  * They deliberately leave `scope.shared` unset so credential-wide exhaustion
@@ -565,7 +603,7 @@ function buildScopedWeeklyUsageLimits(entries: readonly ParsedApiLimitEntry[]): 
 	const limits: UsageLimit[] = [];
 	for (const entry of entries) {
 		if (entry.kind !== "weekly_scoped" || !entry.displayName) continue;
-		const slug = slugifyClaudeLimitDisplayName(entry.displayName);
+		const slug = slugify(entry.displayName);
 		if (!slug || seenSlugs.has(slug)) continue;
 		seenSlugs.add(slug);
 		const limit = buildUsageLimit({
@@ -629,12 +667,19 @@ export function parseClaudeRateLimitHeaders(headers: Record<string, string>, now
 	};
 }
 
+function claudeUsageToken(credential: UsageCredential): string | undefined {
+	if (credential.type === "oauth") return credential.accessToken;
+	const apiKey = credential.apiKey;
+	return apiKey && isAnthropicOAuthToken(apiKey) ? apiKey : undefined;
+}
+
 async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext): Promise<UsageReport | null> {
 	if (params.provider !== "anthropic") return null;
 	const credential = params.credential;
-	if (credential.type !== "oauth" || !credential.accessToken) return null;
+	const accessToken = claudeUsageToken(params.credential);
+	if (!accessToken) return null;
 
-	const headers = buildClaudeOAuthHeaders(credential.accessToken, { beta: CLAUDE_USAGE_BETAS });
+	const headers = buildClaudeOAuthHeaders(accessToken, { beta: CLAUDE_USAGE_BETAS });
 
 	let baseUrl: string | undefined;
 	let payload: ClaudeUsageResponse | null = null;
@@ -663,7 +708,7 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 	const resetCreditList =
 		parseClaudeResetCreditsFromUsagePayload(payload, credential.orgId, baseUrl) ??
 		(await listClaudeResetCredits({
-			accessToken: credential.accessToken,
+			accessToken,
 			accountId: credential.accountId,
 			email: credential.email,
 			orgId: credential.orgId,
@@ -776,6 +821,7 @@ export function parseClaudeUsagePayload(
 	const payloadIdentity = extractUsageIdentity(payload);
 	const accountId = payloadIdentity.accountId ?? identity.accountId;
 	const email = payloadIdentity.email ?? identity.email;
+	const inactiveSharedGates = declaredInactiveSharedGates(raw);
 	return {
 		provider: "anthropic",
 		fetchedAt,
@@ -785,6 +831,7 @@ export function parseClaudeUsagePayload(
 			...(accountId ? { accountId } : {}),
 			...(email ? { email } : {}),
 			...(identity.orgId ? { orgId: identity.orgId } : {}),
+			...(inactiveSharedGates.length > 0 ? { [INACTIVE_SHARED_GATES_KEY]: inactiveSharedGates } : {}),
 		},
 		raw: payload,
 	};
@@ -797,9 +844,10 @@ export const claudeUsageProvider: UsageProvider = {
 	// Anthropic extra-usage rows existed; header ingestion can otherwise keep
 	// renewing those incomplete reports throughout the 24h last-good retention.
 	cacheVersion: 3,
+	failureBackoffMs: FAILURE_BACKOFF_MS,
 	fetchUsage: fetchClaudeUsage,
 	parseRateLimitHeaders: parseClaudeRateLimitHeaders,
-	supports: params => params.provider === "anthropic" && params.credential.type === "oauth",
+	supports: params => params.provider === "anthropic" && !!claudeUsageToken(params.credential),
 };
 
 function getClaudeModelKind(context: CredentialRankingContext | undefined): ClaudeModelKind | undefined {
@@ -944,30 +992,40 @@ export const claudeRankingStrategy: CredentialRankingStrategy = {
 	 * weekly row plus the shared umbrella windows — so a healthy report lifts
 	 * the block while a spent shared 5-hour wall keeps it.
 	 *
-	 * Legacy and shared quota errors also leave account-wide blocks. Only a
-	 * complete report with every reported quota healthy can heal that scope.
+	 * Legacy and shared quota errors also leave account-wide blocks. A
+	 * complete report with every reported quota healthy can heal that scope; a
+	 * report with a single shared window can heal it only when that window's
+	 * reset matches the stored block deadline.
 	 */
 	healableBlockScopes(report) {
 		const sharedLimits = report.limits.filter(limit => limit.scope.shared === true);
+		// Model-family rows still gate the account-wide scope alongside shared windows.
+		const globalScope = {
+			blockScope: "",
+			limits: report.limits.filter(limit => limit.scope.shared === true || limit.scope.tier !== undefined),
+			healthy: report.metadata?.source === "ratelimit-headers" ? false : undefined,
+		};
 		// The endpoint returns a report as soon as one window parses, and a tier
 		// 429 can be caused by a shared wall. A payload missing a shared gate
-		// leaves the block's cause unknown, so vouch for nothing rather than
-		// clear a block that still holds.
-		const everySharedGateReported = CLAUDE_SHARED_GATE_WINDOW_IDS.every(windowId =>
-			sharedLimits.some(limit => limit.scope.windowId === windowId || limit.window?.id === windowId),
-		);
-		if (!everySharedGateReported) return [];
+		// leaves the block's cause unknown. One exception: a report exposing a
+		// single shared window may heal the account-wide block only when that
+		// window's reset is the exact deadline that created the block; without
+		// that match, the missing window could still be the cap behind the 429.
+		// If both windows were spent, the stored deadline is the later reset, so
+		// an early recovery of that window can still lift a block the other
+		// window holds; the next 429 restores it.
+		if (!claudeReportCoversSharedGates(report)) {
+			if (sharedLimits.length !== 1) return [];
+			// Only shared windows are matched against the block deadline.
+			return [{ ...globalScope, resetMatchRequired: true }];
+		}
 		const tiers = new Set<string>();
 		for (const limit of report.limits) {
 			const tier = limit.scope.tier;
 			if (tier === "fable" || tier === "mythos") tiers.add(tier);
 		}
 		return [
-			{
-				blockScope: "",
-				limits: report.limits.filter(limit => limit.scope.shared === true || limit.scope.tier !== undefined),
-				healthy: report.metadata?.source === "ratelimit-headers" ? false : undefined,
-			},
+			globalScope,
 			...[...tiers].map(tier => ({
 				blockScope: `tier:${tier}`,
 				limits: [...sharedLimits, ...report.limits.filter(limit => limit.scope.tier === tier)],

@@ -7,6 +7,7 @@ use uiautomation::{
 		UISelectionItemPattern, UITogglePattern, UIValuePattern,
 	},
 	types::{ControlType, ExpandCollapseState, Handle, Point, UIProperty},
+	variants::Value,
 };
 use windows_sys::Win32::{
 	Foundation::{HWND, POINT},
@@ -35,6 +36,11 @@ impl Win32Ax {
 		Self { automation_initialized: false }
 	}
 
+	/// Uses the COM apartment already initialized and owned by the caller.
+	pub(super) const fn new_initialized() -> Self {
+		Self { automation_initialized: true }
+	}
+
 	fn automation(&mut self) -> CoreResult<UIAutomation> {
 		if self.automation_initialized {
 			UIAutomation::new_direct().map_err(ax_error)
@@ -52,10 +58,16 @@ impl Win32Ax {
 	)]
 	fn element(handle: &AxHandle) -> CoreResult<&UIElement> {
 		match handle {
-			AxHandle::Uia(element) => Ok(element),
+			AxHandle::Uia(element, _) => Ok(element),
 			#[cfg(test)]
 			_ => Err(DesktopError::ax_failed("accessibility handle does not belong to UI Automation")),
 		}
+	}
+
+	/// The control window `handle` is itself, such as a classic edit box's;
+	/// `None` for a windowless element drawn inside a parent's window.
+	pub(super) fn own_window(handle: &AxHandle) -> CoreResult<Option<HWND>> {
+		Ok(native_window(Self::element(handle)?))
 	}
 
 	fn walker(&mut self) -> CoreResult<uiautomation::UITreeWalker> {
@@ -64,7 +76,7 @@ impl Win32Ax {
 
 	/// Top-level window hosting `element`, found through the nearest ancestor
 	/// that owns a native window; `None` for the desktop itself.
-	fn host_root(&mut self, element: &UIElement) -> Option<HWND> {
+	pub(super) fn host_root(&mut self, element: &UIElement) -> Option<HWND> {
 		let walker = self.walker().ok()?;
 		let mut current = element.clone();
 		for _ in 0..64 {
@@ -160,6 +172,20 @@ impl Win32Ax {
 
 fn ax_error(error: impl std::fmt::Display) -> DesktopError {
 	DesktopError::ax_failed(format!("UI Automation failed: {error}"))
+}
+
+/// Handle for `element` carrying the `RuntimeId` that identifies it across
+/// reads, or none when the element reports none. Read as a property:
+/// `UIElement::get_runtime_id` leaks the array UI Automation returns.
+fn uia_handle(element: UIElement) -> AxHandle {
+	let runtime_id = match element
+		.get_property_value(UIProperty::RuntimeId)
+		.and_then(|value| value.get_value())
+	{
+		Ok(Value::ArrayI4(id)) if !id.is_empty() => Some(id.into_boxed_slice()),
+		_ => None,
+	};
+	AxHandle::Uia(element, runtime_id)
 }
 
 /// Native window handle `element` represents, if any.
@@ -281,19 +307,24 @@ fn actions(element: &UIElement) -> Vec<String> {
 	actions
 }
 
-fn value(element: &UIElement) -> Option<String> {
+fn pattern_value(element: &UIElement) -> Option<String> {
 	element
 		.get_pattern::<UIValuePattern>()
 		.and_then(|pattern| pattern.get_value())
 		.ok()
+}
+
+fn legacy_value(element: &UIElement) -> Option<String> {
+	element
+		.get_pattern::<UILegacyIAccessiblePattern>()
+		.and_then(|pattern| pattern.get_value())
+		.ok()
+}
+
+fn value(element: &UIElement) -> Option<String> {
+	pattern_value(element)
 		.filter(|value| !value.is_empty())
-		.or_else(|| {
-			element
-				.get_pattern::<UILegacyIAccessiblePattern>()
-				.and_then(|pattern| pattern.get_value())
-				.ok()
-				.filter(|value| !value.is_empty())
-		})
+		.or_else(|| legacy_value(element).filter(|value| !value.is_empty()))
 }
 
 fn truncate(value: impl ToString) -> String {
@@ -338,7 +369,7 @@ impl AxBackend for Win32Ax {
 		self
 			.automation()?
 			.element_from_handle(handle)
-			.map(AxHandle::Uia)
+			.map(uia_handle)
 			.map_err(ax_error)
 	}
 
@@ -369,6 +400,11 @@ impl AxBackend for Win32Ax {
 			bounds,
 			actions: actions(element),
 			child_count,
+			identity: None,
+			partial: false,
+			label_complete: false,
+			selected: false,
+			role_name: None,
 		})
 	}
 
@@ -379,13 +415,13 @@ impl AxBackend for Win32Ax {
 			.get_children(element)
 			.unwrap_or_default()
 			.into_iter()
-			.map(AxHandle::Uia)
+			.map(uia_handle)
 			.collect())
 	}
 
 	fn parent(&mut self, handle: &AxHandle) -> CoreResult<Option<AxHandle>> {
 		let element = Self::element(handle)?;
-		Ok(self.walker()?.get_parent(element).ok().map(AxHandle::Uia))
+		Ok(self.walker()?.get_parent(element).ok().map(uia_handle))
 	}
 
 	fn perform(&mut self, handle: &AxHandle, action: &str) -> CoreResult<()> {
@@ -443,14 +479,55 @@ impl AxBackend for Win32Ax {
 		})
 	}
 
-	fn set_value(&mut self, handle: &AxHandle, value: &str) -> CoreResult<()> {
+	fn set_value(&mut self, handle: &AxHandle, text: &str) -> CoreResult<()> {
 		let element = Self::element(handle)?;
-		self.contained(element, || {
-			element
-				.get_pattern::<UIValuePattern>()
-				.and_then(|pattern| pattern.set_value(value))
-				.map_err(ax_error)
-		})
+		let password = element.is_password().ok();
+		let secure = password.unwrap_or(true);
+		let hwnd = native_window(element).map(super::value_write::combo_target);
+		let class = hwnd.map_or_default(window::class_name);
+		match super::value_write::route(&class) {
+			super::value_write::ValueRoute::Combo => {
+				return super::value_write::set_combo(
+					hwnd.ok_or_else(|| {
+						DesktopError::ax_failed(
+							"combo box has no native window; select the item via press/click instead",
+						)
+					})?,
+					text,
+					element.is_enabled().map_err(ax_error)?,
+					secure,
+				);
+			},
+			super::value_write::ValueRoute::RefuseCombo => {
+				return Err(DesktopError::ax_failed(
+					"this combo box cannot notify the app through setValue; select the item via \
+					 press/click instead",
+				));
+			},
+			super::value_write::ValueRoute::Pattern => self.contained(element, || {
+				element
+					.get_pattern::<UIValuePattern>()
+					.and_then(|pattern| pattern.set_value(text))
+					.map_err(ax_error)
+			})?,
+		}
+		// Password providers cannot supply evidence, so do not query hidden
+		// or protected representations just to discard them.
+		let pattern = if password == Some(true) {
+			None
+		} else {
+			pattern_value(element)
+		};
+		let legacy = if password != Some(true) && pattern.is_none() {
+			legacy_value(element)
+		} else {
+			None
+		};
+		let read = pattern.as_deref().or(legacy.as_deref());
+		if read.is_some_and(|read| super::value_write::rich_edit_holds(&class, text, read)) {
+			return Ok(());
+		}
+		super::value_write::verdict(text, pattern.as_deref(), legacy.as_deref(), password)
 	}
 
 	fn focus(&mut self, handle: &AxHandle) -> CoreResult<()> {
@@ -461,7 +538,7 @@ impl AxBackend for Win32Ax {
 		self
 			.automation()?
 			.element_from_point(Point::new(x.round() as i32, y.round() as i32))
-			.map(AxHandle::Uia)
+			.map(uia_handle)
 			.map(Some)
 			.map_err(ax_error)
 	}
@@ -470,7 +547,7 @@ impl AxBackend for Win32Ax {
 		self
 			.automation()?
 			.get_focused_element()
-			.map(AxHandle::Uia)
+			.map(uia_handle)
 			.map(Some)
 			.map_err(ax_error)
 	}
@@ -518,6 +595,13 @@ impl AxBackend for Win32Ax {
 			}
 		}
 		Ok(attributes)
+	}
+
+	/// `RuntimeId`s are only unique among live elements. Any failure to read
+	/// the stored element counts as gone: a needless new ref is harmless, a ref
+	/// renewed onto another element is not.
+	fn alive(&mut self, handle: &AxHandle) -> bool {
+		Self::element(handle).is_ok_and(|element| element.get_process_id().is_ok())
 	}
 }
 

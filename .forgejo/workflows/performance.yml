@@ -2,7 +2,11 @@ name: Performance measurements
 
 on:
   push:
+    branches:
+      - main
+      - master
   pull_request:
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
       seed_baseline:
@@ -11,11 +15,16 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   performance:
     runs-on: ci-rust
-    uses: http://192.168.1.4:3000/justdoGIT/ci-templates/.forgejo/workflows/reusable-performance.yml@83ac654c9b72024842eb7ea1163a3c403acf90d4
+    uses: https://forgejo.kepr.dev/justdoGIT/ci-templates/.forgejo/workflows/reusable-performance.yml@1c96fd261aac57dca9471906d02af8fe643b809c
     with:
+      runs_on: ci-rust
       runner_label: ci-rust
-      templates_ref: 83ac654c9b72024842eb7ea1163a3c403acf90d4
+      templates_ref: 1c96fd261aac57dca9471906d02af8fe643b809c
       seed_baseline: ${{ github.event_name == 'workflow_dispatch' && inputs.seed_baseline }}

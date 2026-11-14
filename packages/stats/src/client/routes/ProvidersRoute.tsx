@@ -15,7 +15,7 @@ import {
 } from "../data/formatters";
 import { type QueryResult, useQuery } from "../data/query";
 import { bucketAxis, formatBucket, formatTick, rangeMeta } from "../data/range";
-import { densify, pivotSeries } from "../data/series";
+import { bucketAt, densify, pivotSeries } from "../data/series";
 import type {
 	ProviderAggregate,
 	ProviderHourlyPoint,
@@ -75,14 +75,16 @@ interface WindowRef {
 }
 
 export function ProvidersRoute({ active, range }: ProvidersRouteProps) {
-	const stats = useQuery(["providers", range], () => getProviderDashboardStats(range), { enabled: active });
+	const stats = useQuery(["providers", range], ({ signal }) => getProviderDashboardStats(range, signal), {
+		enabled: active,
+	});
 	const [metric, setMetric] = useState<BurnMetric>("tokens");
 	const [hidden, toggleHidden] = useHiddenSeries();
 	const meta = rangeMeta(range);
 
 	// Subscription windows load independently: insights for every provider
 	// first, then utilization series for the one provider being charted.
-	const windows = useQuery(["provider-windows", range], () => getProviderWindowStats(range, null), {
+	const windows = useQuery(["provider-windows", range], ({ signal }) => getProviderWindowStats(range, null, signal), {
 		enabled: active,
 	});
 	const [picked, setPicked] = useState<WindowRef | null>(null);
@@ -90,7 +92,7 @@ export function ProvidersRoute({ active, range }: ProvidersRouteProps) {
 	const selectedProvider = selected?.provider ?? null;
 	const accounts = useQuery(
 		["provider-windows", range, selectedProvider],
-		() => getProviderWindowStats(range, selectedProvider),
+		({ signal }) => getProviderWindowStats(range, selectedProvider, signal),
 		{ enabled: active && selectedProvider !== null },
 	);
 
@@ -937,7 +939,6 @@ function buildUtilization(accounts: UsageWindowSeries[], names: ReadonlyMap<stri
 	const span = last - first;
 	const bucketMs = UTIL_STEPS.find(step => span / step < MAX_UTIL_SLOTS) ?? DAY_MS;
 	const buckets = bucketAxis("all", [first], bucketMs, last);
-	const index = (ts: number) => Math.floor((ts - buckets[0]) / bucketMs);
 	const exhausted = buckets.map((): string[] => []);
 	let max = 0;
 
@@ -948,8 +949,9 @@ function buildUtilization(accounts: UsageWindowSeries[], names: ReadonlyMap<stri
 		const values: (number | null)[] = buckets.map(() => null);
 		const readAt: number[] = buckets.map(() => 0);
 		for (const p of account.points) {
-			const i = index(p.timestamp);
-			if (i < 0 || i >= buckets.length) continue;
+			// Floor search: day buckets start at local midnight, so they are not uniform.
+			const i = bucketAt(buckets, p.timestamp);
+			if (i < 0) continue;
 			if (p.exhausted && !exhausted[i].includes(nameOf(account))) exhausted[i].push(nameOf(account));
 			if (p.usedFraction === null || p.timestamp < readAt[i]) continue;
 			values[i] = p.usedFraction;

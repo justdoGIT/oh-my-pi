@@ -5,17 +5,24 @@
 #   build-bridge.sh detect
 #       Prints "<swiftc>\t<sdk>\t<fingerprint>" for the first toolchain able to
 #       build bridge.swift (Swift 6.4+ with the macOS 27+ SDK), or nothing.
-#       Candidates: $OMP_APPLEFM_SWIFTC and the xcode-select'ed toolchain with
-#       the selected SDK, then the Command Line Tools with their own SDK. A set
-#       $SDKROOT is the SDK for every candidate, so the bridge never links
-#       against a different SDK than the rest of the addon. Probes versions
-#       only; never compiles.
+#       Candidates: the xcode-select'ed toolchain with the selected SDK, then
+#       the Command Line Tools with their own SDK. A set $OMP_APPLEFM_SWIFTC is
+#       the only candidate: an explicitly configured compiler is never
+#       substituted, and detect exits 1 when it is unusable. A set $SDKROOT
+#       is the SDK for every candidate, so the bridge never links against a
+#       different SDK than the rest of the addon. Probes versions only; never
+#       compiles.
+#       $OMP_APPLEFM_DISABLE=1 selects nothing without probing any toolchain,
+#       so an opted-out build never compiles the bridge with host tools;
+#       setting it together with $OMP_APPLEFM_SWIFTC is an error.
 #
-#   build-bridge.sh build <out.dylib> <arch> [<swiftc> <sdk>]
+#   build-bridge.sh build <out.dylib> <arch> [<swiftc> <sdk> [<swiftc arg>...]]
 #       Compiles bridge.swift into a standalone <out.dylib> with the given
-#       toolchain. Without a toolchain, or for a non-arm64 <arch> (Foundation
-#       Models needs Apple silicon), writes an empty <out.dylib>, which the
-#       addon reports as not built.
+#       toolchain; trailing arguments go to swiftc (the linux cross toolchain's
+#       resource dir, shims path and linker, see bazel/toolchains/swift). Without
+#       a toolchain, or for a non-arm64 <arch> (Foundation Models needs Apple
+#       silicon), writes an empty <out.dylib>, which the addon reports as not
+#       built.
 #
 # The bridge is never linked into the addon: the addon embeds these bytes and
 # dlopens them only on macOS 27+, so the Swift runtime and FoundationModels
@@ -45,12 +52,23 @@ usable() {
 }
 
 detect() {
+	if [ "${OMP_APPLEFM_DISABLE:-}" = 1 ]; then
+		if [ -n "${OMP_APPLEFM_SWIFTC:-}" ]; then
+			echo "OMP_APPLEFM_DISABLE=1 conflicts with OMP_APPLEFM_SWIFTC; set only one" >&2
+			return 1
+		fi
+		return 0
+	fi
 	selected_sdk=${SDKROOT:-$(/usr/bin/xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)}
 	clt=/Library/Developer/CommandLineTools
-	for candidate in \
-		"${OMP_APPLEFM_SWIFTC:-}|$selected_sdk" \
-		"$(/usr/bin/xcrun --find swiftc 2>/dev/null || true)|$selected_sdk" \
-		"$clt/usr/bin/swiftc|${SDKROOT:-$clt/SDKs/MacOSX.sdk}"; do
+	if [ -n "${OMP_APPLEFM_SWIFTC:-}" ]; then
+		set -- "$OMP_APPLEFM_SWIFTC|$selected_sdk"
+	else
+		set -- \
+			"$(/usr/bin/xcrun --find swiftc 2>/dev/null || true)|$selected_sdk" \
+			"$clt/usr/bin/swiftc|${SDKROOT:-$clt/SDKs/MacOSX.sdk}"
+	fi
+	for candidate; do
 		swiftc=${candidate%%|*}
 		sdk=${candidate#*|}
 		if usable "$swiftc" "$sdk"; then
@@ -60,6 +78,10 @@ detect() {
 			return 0
 		fi
 	done
+	if [ -n "${OMP_APPLEFM_SWIFTC:-}" ]; then
+		echo "OMP_APPLEFM_SWIFTC=$OMP_APPLEFM_SWIFTC is not a Swift 6.4+ compiler with a macOS 27+ SDK; unset it to build without Apple Foundation Models" >&2
+		return 1
+	fi
 }
 
 build() {
@@ -67,6 +89,7 @@ build() {
 	arch=$2
 	swiftc=${3:-}
 	sdk=${4:-}
+	shift $(($# < 4 ? $# : 4))
 	rm -f "$out"
 	if [ "$arch" = arm64 ] && [ -n "$swiftc" ]; then
 		cache=${OMP_APPLEFM_MODULE_CACHE:-${TMPDIR:-/tmp}/omp-applefm-module-cache}
@@ -76,7 +99,7 @@ build() {
 			-sdk "$sdk" -target arm64-apple-macos27.0 -swift-version 6 -O \
 			-module-cache-path "$cache" \
 			-Xlinker -install_name -Xlinker @rpath/libomp_applefm.dylib \
-			"$here/bridge.swift" -o "$out"
+			"$@" "$here/bridge.swift" -o "$out"
 		return
 	fi
 	: >"$out"

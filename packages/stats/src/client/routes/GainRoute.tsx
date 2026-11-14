@@ -28,8 +28,8 @@ const DAY_MS = 86_400_000;
 
 const SOURCE_LABEL: Record<GainSource, string> = { snapcompact: "Snapcompact" };
 
-/** The server buckets gain by UTC calendar day (`YYYY-MM-DD`). */
-const DAY_LABEL = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
+/** The server buckets gain by local calendar day (`YYYY-MM-DD`). */
+const DAY_LABEL = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
 
 interface SourceRow extends GainSourceTotals {
 	source: GainSource;
@@ -39,12 +39,15 @@ interface SourceRow extends GainSourceTotals {
 
 export function GainRoute({ active, range }: GainRouteProps) {
 	const [project, setProject] = useState<string | null>(null);
-	const gain = useQuery(["gain", range, project], () => getGainDashboardStats(range, project), { enabled: active });
+	const gain = useQuery(["gain", range, project], ({ signal }) => getGainDashboardStats(range, project, signal), {
+		enabled: active,
+	});
 	const meta = rangeMeta(range);
 	const data = gain.data;
 
 	const series = useMemo(() => {
-		const points = (data?.timeSeries ?? []).map(p => ({ ...p, timestamp: Date.parse(`${p.date}T00:00:00Z`) }));
+		// A date-time string without an offset parses as local midnight.
+		const points = (data?.timeSeries ?? []).map(p => ({ ...p, timestamp: Date.parse(`${p.date}T00:00:00`) }));
 		const buckets = bucketAxis(
 			range,
 			points.map(p => p.timestamp),
@@ -154,7 +157,7 @@ export function GainRoute({ active, range }: GainRouteProps) {
 						<Card
 							index={1}
 							title="Savings over time"
-							description="Tokens saved per UTC day, with the running total"
+							description="Tokens saved per day, with the running total"
 							actions={<Legend items={chartSeries.map(s => ({ key: s.key, label: s.label, color: s.color }))} />}
 							stale={gain.stale}
 						>

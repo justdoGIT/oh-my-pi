@@ -1,0 +1,13 @@
+tests/
+test/
+vendor/
+third_party/
+node_modules/
+contributors/
+website/
+docs/
+packages/catalog/
+*.lock
+*.min.js
+*.json
+*.md

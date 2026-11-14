@@ -17,6 +17,7 @@ import * as path from "node:path";
 import { expandWindowsLongPath } from "@oh-my-pi/pi-natives/path";
 import { engines, version } from "../package.json" with { type: "json" };
 import { isEnoent, isEnotdir } from "./fs-error";
+import { isBunTestRuntime } from "./test-runtime";
 
 /** App name (e.g. "omp") */
 export const APP_NAME: string = "omp";
@@ -160,18 +161,43 @@ function standardizeProjectPath(p: string): string {
 	return process.platform === "win32" ? expandWindowsLongPath(p) : standardizeMacOSPath(p);
 }
 
-export function resolveEquivalentPath(inputPath: string): string {
+export interface EquivalentPathOptions {
+	/**
+	 * Resolve a path that does not exist yet through its deepest existing ancestor, keeping the
+	 * missing suffix, so a symlinked parent canonicalizes the same before and after the path appears.
+	 */
+	throughMissing?: boolean;
+}
+
+export function resolveEquivalentPath(inputPath: string, options?: EquivalentPathOptions): string {
 	const resolvedPath = path.resolve(inputPath);
 	try {
 		return fs.realpathSync(resolvedPath);
 	} catch {
-		return resolvedPath;
+		if (!options?.throughMissing) return resolvedPath;
+	}
+	const missing: string[] = [];
+	let current = resolvedPath;
+	for (;;) {
+		const parent = path.dirname(current);
+		if (parent === current) return resolvedPath;
+		missing.unshift(path.basename(current));
+		current = parent;
+		try {
+			return path.join(fs.realpathSync(current), ...missing);
+		} catch {
+			// Keep walking: a higher ancestor may exist.
+		}
 	}
 }
 
-export function normalizePathForComparison(inputPath: string): string {
-	const resolvedPath = resolveEquivalentPath(inputPath);
+function comparablePath(inputPath: string, options?: EquivalentPathOptions): string {
+	const resolvedPath = resolveEquivalentPath(inputPath, options);
 	return process.platform === "win32" ? resolvedPath.toLowerCase() : resolvedPath;
+}
+
+export function normalizePathForComparison(inputPath: string): string {
+	return comparablePath(inputPath);
 }
 
 /**
@@ -189,9 +215,10 @@ export function relativePathWithinNormalizedRoot(normalizedRoot: string, normali
 	return relative;
 }
 
-export function pathIsWithin(root: string, candidate: string): boolean {
+/** `options` apply to `candidate` only. */
+export function pathIsWithin(root: string, candidate: string, options?: EquivalentPathOptions): boolean {
 	const normalizedRoot = normalizePathForComparison(root);
-	const normalizedCandidate = normalizePathForComparison(candidate);
+	const normalizedCandidate = comparablePath(candidate, options);
 	return relativePathWithinNormalizedRoot(normalizedRoot, normalizedCandidate) !== null;
 }
 
@@ -242,25 +269,23 @@ export function __resetProjectDirCacheForTests(): void {
 	projectDir = undefined;
 }
 
-/** Whether a path is absent or not a directory. Other stat failures return false. */
-export async function directoryIsMissing(dir: string): Promise<boolean> {
+/** Whether a path is absent or not a directory; `strict` propagates non-missing stat failures. */
+export async function directoryIsMissing(dir: string, options?: { strict?: boolean }): Promise<boolean> {
 	try {
 		return !(await fs.promises.stat(dir)).isDirectory();
 	} catch (error) {
-		return isEnoent(error) || isEnotdir(error);
+		if (isEnoent(error) || isEnotdir(error)) return true;
+		if (options?.strict) throw error;
+		return false;
 	}
 }
 
-/**
- * Whether `dir` resolves to an existing directory. Any stat failure — a deleted
- * path (ENOENT), permission error, or a non-directory — returns `false`, so
- * callers can decide whether a directory is safe to `chdir` into or adopt as a
- * working directory before {@link setProjectDir} throws on it.
- */
-export async function directoryExists(dir: string): Promise<boolean> {
+/** Whether a path is an existing directory; `strict` propagates non-missing stat failures. */
+export async function directoryExists(dir: string, options?: { strict?: boolean }): Promise<boolean> {
 	try {
 		return (await fs.promises.stat(dir)).isDirectory();
-	} catch {
+	} catch (error) {
+		if (options?.strict && !isEnoent(error) && !isEnotdir(error)) throw error;
 		return false;
 	}
 }
@@ -306,12 +331,6 @@ export function getSafeProjectCwd(): string {
 /** Get the config directory name relative to home (e.g. ".omp" or PI_CONFIG_DIR override). */
 export function getConfigDirName(): string {
 	return process.env.PI_CONFIG_DIR || CONFIG_DIR_NAME;
-}
-
-/** Get the config agent directory name relative to home (e.g. ".omp/agent" or PI_CONFIG_DIR + "/agent"). */
-export function getConfigAgentDirName(): string {
-	const profile = getActiveProfile();
-	return profile ? path.join(getConfigDirName(), "profiles", profile, "agent") : `${getConfigDirName()}/agent`;
 }
 
 // =============================================================================
@@ -634,8 +653,34 @@ export function getReportsDir(): string {
 	return dirs.rootSubdir("reports", "state");
 }
 
-/** Get the logs directory (~/.omp/logs). */
+/**
+ * Get the self-update state directory (~/.omp/update): the background
+ * auto-update's status file and worker log, and the lock that keeps two
+ * installs (`omp update`, auto-update) from running at once.
+ */
+export function getUpdateStateDir(): string {
+	return dirs.rootSubdir("update", "state");
+}
+
+/**
+ * Return a per-user directory (`<tmpdir>/<prefix>-<uid>`) under the OS temp dir
+ * so `bun test` state never collides across accounts sharing `/tmp`.
+ */
+export function getTestTempDir(prefix: string): string {
+	const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
+	return path.join(os.tmpdir(), `${prefix}-${uid}`);
+}
+
+/**
+ * Get the logs directory (~/.omp/logs). `bun test` processes get
+ * `<tmpdir>/omp-test-logs-<uid>` instead, so suites never write into the
+ * developer's real logs; the uid suffix (as for the test session-owners dir)
+ * keeps users of a shared `/tmp` from owning each other's directory.
+ */
 export function getLogsDir(): string {
+	if (isBunTestRuntime()) {
+		return getTestTempDir("omp-test-logs");
+	}
 	return dirs.rootSubdir("logs", "state");
 }
 
@@ -697,12 +742,14 @@ export function getRemoteDir(): string {
  * Expand a leading `~` and require an absolute result. Returns `undefined` for
  * empty/whitespace input or a path that is still relative after expansion.
  *
- * A worktree base is process-global and consumed by both creation
- * (PR checkout, task isolation) and cleanup (`omp worktree`). A relative value
- * would resolve against whatever cwd happened to launch `omp`, so checkout and
- * cleanup could disagree — we refuse it rather than silently bind it to cwd.
+ * Worktree bases and the natives directory are process-global: a worktree base
+ * is consumed by both creation (PR checkout, task isolation) and cleanup
+ * (`omp worktree`), and every launch extracts or loads the native addon from
+ * the same natives directory. A relative value would resolve against whatever
+ * cwd happened to launch `omp`, so those readers could disagree — we refuse it
+ * rather than silently bind it to cwd.
  */
-function resolveWorktreeBase(value: string | undefined): string | undefined {
+function resolveAbsoluteDir(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
 	if (!trimmed) return undefined;
 	let p = trimmed;
@@ -719,13 +766,13 @@ let worktreesDirOverride: string | undefined;
  * `worktree.base` setting in coding-agent; pass `undefined`/empty to clear and
  * fall back to `OMP_WORKTREE_DIR` or the `~/.omp/wt` default.
  *
- * `~` is expanded and a relative path is rejected (see {@link resolveWorktreeBase}).
+ * `~` is expanded and a relative path is rejected (see {@link resolveAbsoluteDir}).
  * Returns the absolute path that took effect, or `undefined` if the input was
  * cleared or rejected — callers can warn on a non-empty input that returns
  * `undefined`.
  */
 export function setWorktreesDir(dir: string | undefined): string | undefined {
-	worktreesDirOverride = resolveWorktreeBase(dir);
+	worktreesDirOverride = resolveAbsoluteDir(dir);
 	return worktreesDirOverride;
 }
 
@@ -737,7 +784,7 @@ export function setWorktreesDir(dir: string | undefined): string | undefined {
  * ignored and resolution falls through.
  */
 export function getWorktreesDir(): string {
-	return resolveWorktreeBase(process.env.OMP_WORKTREE_DIR) ?? worktreesDirOverride ?? dirs.rootSubdir("wt", "data");
+	return resolveAbsoluteDir(process.env.OMP_WORKTREE_DIR) ?? worktreesDirOverride ?? dirs.rootSubdir("wt", "data");
 }
 
 /** Get the SSH control socket directory (~/.omp/ssh-control). */
@@ -763,6 +810,15 @@ export function getPythonGatewayDir(): string {
 /** Get the puppeteer sandbox directory (~/.omp/puppeteer). */
 export function getPuppeteerDir(): string {
 	return dirs.rootSubdir("puppeteer", "cache");
+}
+
+/**
+ * Get where the WebKit browser engine's host executable is installed: `ABHost` (`ABHost.exe` on Windows)
+ * in the ABKit engine directory `~/.o2/lib/abkit`. The location is shared with Tern, so it is outside omp's
+ * own directories.
+ */
+export function getWebKitHostPath(platform: NodeJS.Platform = process.platform): string {
+	return path.join(os.homedir(), ".o2", "lib", "abkit", platform === "win32" ? "ABHost.exe" : "ABHost");
 }
 
 /** Get the browser relay extension install directory (~/.omp/browser-relay). */
@@ -863,9 +919,18 @@ export function getFastembedRuntimeDir(): string {
 	return dirs.rootSubdir(path.join("cache", "fastembed-runtime"), "cache");
 }
 
-/** Get the natives directory (~/.omp/natives). */
+/**
+ * Get the directory the native addon loads downloaded tree-sitter wasm grammars
+ * from (`<natives dir>/grammars`, ~/.omp/natives/grammars). The natives loader
+ * configures the addon with the same path.
+ */
+export function getNativeGrammarsDir(): string {
+	return path.join(getNativesDir(), "grammars");
+}
+
+/** Get the natives directory. PI_NATIVES_DIR overrides the usual cache root; relative values are ignored. */
 export function getNativesDir(): string {
-	return dirs.rootSubdir("natives", "cache");
+	return resolveAbsoluteDir(process.env.PI_NATIVES_DIR) ?? dirs.rootSubdir("natives", "cache");
 }
 
 /** Get the stats database path (~/.omp/stats.db). */
@@ -1069,6 +1134,11 @@ export function getSecretPlaceholderKeyPath(): string {
 /** Directory holding the per-model tiny-worker sockets and logs (~/.omp/run/tiny; XDG default: $XDG_STATE_HOME/omp/run/tiny). */
 export function getTinyWorkerRuntimeDir(): string {
 	return dirs.rootSubdir(path.join("run", "tiny"), "state");
+}
+
+/** Directory holding the per-model mnemopi embedding server endpoints and logs (~/.omp/run/mnemopi; XDG default: $XDG_STATE_HOME/omp/run/mnemopi). */
+export function getMnemopiEmbedRuntimeDir(): string {
+	return dirs.rootSubdir(path.join("run", "mnemopi"), "state");
 }
 
 /** Root directory containing every per-project daemon runtime scope (~/.omp/run/daemons; XDG default: $XDG_STATE_HOME/omp/run/daemons). */
