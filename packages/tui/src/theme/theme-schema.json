@@ -33,7 +33,7 @@
 		},
 		"colors": {
 			"type": "object",
-			"description": "Theme color definitions (all required except thinkingMax)",
+			"description": "Theme color definitions (all required except thinkingMax, assistantMessageText and mdExtensionLink)",
 			"required": [
 				"accent",
 				"border",
@@ -143,6 +143,10 @@
 					"$ref": "#/$defs/colorValue",
 					"description": "Default text color (usually empty string)"
 				},
+				"assistantMessageText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Assistant paragraph prose color (optional; empty string or omitted keeps the terminal default foreground)"
+				},
 				"thinkingText": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Thinking text color"
@@ -198,6 +202,10 @@
 				"mdLink": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Markdown link text"
+				},
+				"mdExtensionLink": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Markdown link text for links an extension handles instead of opening a URL (optional; omitted derives a muted blend of mdLink and text)"
 				},
 				"mdLinkUrl": {
 					"$ref": "#/$defs/colorValue",
@@ -415,7 +423,7 @@
 				},
 				"ansi": {
 					"type": "array",
-					"description": "ANSI colors 0-15",
+					"description": "ANSI colors 0-15; also the palette colorful Markdown (tui.colorfulMarkdown) paints headings, emphasis, inline code and table headers from",
 					"items": { "$ref": "#/$defs/colorValue" },
 					"minItems": 16,
 					"maxItems": 16

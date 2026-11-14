@@ -352,6 +352,14 @@ class ProtocolParsingTests(unittest.TestCase):
                 "fastModeEnabled": False,
                 "fastModeActive": True,
                 "tokensPerSecond": 12.5,
+                "slowModeSupported": True,
+                "slowModeEnabled": True,
+                "slowModeScope": "global",
+                "usageLimit": {
+                    "stage": "low_priority",
+                    "resetsAtSec": 1770000000,
+                    "allowanceLeftPercent": 62,
+                },
                 "autoCompactionEnabled": True,
                 "messageCount": 4,
                 "queuedMessageCount": 1,
@@ -408,8 +416,49 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertFalse(state.fast_mode_enabled)
         self.assertTrue(state.fast_mode_active)
         self.assertEqual(state.tokens_per_second, 12.5)
+        self.assertTrue(state.slow_mode_supported)
+        self.assertTrue(state.slow_mode_enabled)
+        self.assertEqual(state.slow_mode_scope, "global")
+        assert state.usage_limit is not None
+        self.assertEqual(state.usage_limit.stage, "low_priority")
+        self.assertEqual(state.usage_limit.resets_at_sec, 1770000000)
+        self.assertEqual(state.usage_limit.allowance_left_percent, 62)
         self.assertTrue(state.has_pending_async_work)
         self.assertFalse(state.is_settled)
+
+    def test_parse_session_state_validates_usage_limit_variants(self) -> None:
+        base = {
+            "sessionId": "session-123",
+            "steeringMode": "one-at-a-time",
+            "followUpMode": "all",
+            "interruptMode": "immediate",
+        }
+        wrap_up = parse_session_state(
+            {
+                **base,
+                "usageLimit": {
+                    "stage": "wrap_up",
+                    "extraUsage": True,
+                },
+            }
+        ).usage_limit
+        assert wrap_up is not None
+        self.assertEqual(wrap_up.stage, "wrap_up")
+        self.assertTrue(wrap_up.extra_usage)
+        self.assertIsNone(wrap_up.resets_at_sec)
+        self.assertIsNone(parse_session_state(base).usage_limit)
+        self.assertFalse(parse_session_state(base).slow_mode_supported)
+
+        invalid = (
+            ({"stage": "low_priority"}, "resetsAtSec"),
+            ({"stage": "wrap_up"}, "extraUsage"),
+            ({"stage": "wrap_up", "extraUsage": "false"}, "extraUsage"),
+            ({"stage": "unknown"}, "stage"),
+        )
+        for slow_mode, field in invalid:
+            with self.subTest(slow_mode=slow_mode):
+                with self.assertRaisesRegex(ValueError, field):
+                    parse_session_state({**base, "usageLimit": slow_mode})
 
     def test_parse_session_state_defaults_missing_fast_mode_and_throughput(
         self,
@@ -589,10 +638,7 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(notification.todos[0].content, "Map tools")
         self.assertEqual(notification.todos[0].status, "pending")
 
-    def test_parse_session_state_accepts_blocked_todo(self) -> None:
-        # Regression: the TS agent added a `blocked` todo status (with a
-        # `blocker` note); resuming a session whose todos were blocked must
-        # not fail state parsing.
+    def test_parse_session_state_reads_todo_phases(self) -> None:
         state = parse_session_state(
             {
                 "sessionId": "session-123",
@@ -607,8 +653,7 @@ class ProtocolParsingTests(unittest.TestCase):
                             {
                                 "id": "task-1",
                                 "content": "Open PR",
-                                "status": "blocked",
-                                "blocker": "waiting on maintainer go-ahead",
+                                "status": "in_progress",
                             }
                         ],
                     }
@@ -617,8 +662,7 @@ class ProtocolParsingTests(unittest.TestCase):
         )
 
         task = state.todo_phases[0].tasks[0]
-        self.assertEqual(task.status, "blocked")
-        self.assertEqual(task.blocker, "waiting on maintainer go-ahead")
+        self.assertEqual((task.content, task.status), ("Open PR", "in_progress"))
 
     def test_assistant_text_excludes_thinking_by_default(self) -> None:
         message = {

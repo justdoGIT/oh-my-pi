@@ -30,9 +30,7 @@ impl GitRepo {
 		if let Some(repo) = self.gix.get() {
 			return Ok(repo.to_thread_local());
 		}
-		let opened = open_options()
-			.open(self.root())
-			.map_err(|err| Error::backend("git open", err))?;
+		let opened = open_discovered(self)?;
 		// A concurrent open may have won the race; either handle is equivalent.
 		let repo = self.gix.get_or_init(move || opened);
 		Ok(repo.to_thread_local())
@@ -50,11 +48,22 @@ impl GitRepo {
 				"reftable repository cannot be opened in-process; use the CLI fallback",
 			));
 		}
-		Ok(open_options()
-			.open(self.root())
-			.map_err(|err| Error::backend("git open", err))?
-			.to_thread_local())
+		Ok(open_discovered(self)?.to_thread_local())
 	}
+}
+
+/// Open the discovered `.git` entry (directory, or gitfile for linked
+/// worktrees and separate git dirs).
+///
+/// Never pass the checkout root: gix treats any `*.git` path as the metadata
+/// directory itself instead of probing `<path>/.git`, so a checkout named
+/// `repo.git` would fail to open. The entry also keeps gix deriving the work
+/// tree from it, which the resolved `git_dir` alone cannot for separate git
+/// dirs.
+fn open_discovered(repo: &GitRepo) -> Result<gix::ThreadSafeRepository> {
+	open_options()
+		.open(&repo.info().git_entry_path)
+		.map_err(|err| Error::backend("git open", err))
 }
 
 /// Load the persisted worktree index straight from disk, reconstructing it from
@@ -164,4 +173,27 @@ fn open_options() -> Options {
 			attributes: permissions::Attributes::all(),
 		})
 		.with(Trust::Full)
+}
+
+/// The index at `index_path`, or the repository's when `None`; `None` when an
+/// alternate index does not exist yet.
+pub(crate) fn load_index_at(
+	repo: &gix::Repository,
+	index_path: Option<&std::path::Path>,
+) -> Result<Option<gix::index::File>> {
+	let Some(path) = index_path else {
+		return load_index_or_head(repo, "git read index").map(Some);
+	};
+	match std::fs::metadata(path) {
+		Ok(_) => gix::index::File::at(
+			path,
+			repo.object_hash(),
+			false,
+			gix::index::decode::Options::default(),
+		)
+		.map(Some)
+		.map_err(|err| Error::backend("git read alternate index", err)),
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+		Err(err) => Err(err.into()),
+	}
 }

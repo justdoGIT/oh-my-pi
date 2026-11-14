@@ -44,9 +44,12 @@ export interface NetworkRouteDescription {
 
 /** Byte counts associated with one browser request. */
 export interface NetworkRequestSizes {
-	/** Encoded request body bytes, when present. */
-	requestBody: number;
-	/** Encoded response body bytes, when known. */
+	/** Request body bytes (0 for none); left out where the backend cannot see request bodies (omp's WebKit host). */
+	requestBody?: number;
+	/**
+	 * The response body's declared `Content-Length` (its size on the wire); without one, the size of the body once
+	 * `tab.request()` loaded it, on backends that keep bodies. Left out while neither is known.
+	 */
 	responseBody?: number;
 }
 
@@ -62,7 +65,10 @@ export interface NetworkRequestRecord {
 	method: string;
 	/** Requested URL. */
 	url: string;
-	/** Puppeteer resource type. */
+	/**
+	 * Puppeteer resource type. omp's WebKit host names none and omp derives it from the request: there `fetch` stands
+	 * for `xhr` too, and `document`/`subdocument` only for a frame's navigation.
+	 */
 	resourceType: string;
 	/** HTTP response status, when a response arrived. */
 	status?: number;
@@ -165,9 +171,14 @@ export class BrowserNetworkManager {
 	#interceptionEnabled = false;
 	#started = false;
 	#harSession?: HarSession;
+	/** Main-frame document requests that have neither a response nor a final failure/finish yet. */
+	readonly #pendingNavigations = new Set<HTTPRequest>();
 
 	readonly #onRequest = async (request: HTTPRequest): Promise<void> => {
 		const record = this.#rememberRequest(request);
+		if (request.isNavigationRequest() && request.frame() === this.#page.mainFrame()) {
+			this.#pendingNavigations.add(request);
+		}
 		if (!this.hasPersistentInterception()) return;
 		try {
 			if (!this.#isAllowed(request.url())) {
@@ -204,6 +215,7 @@ export class BrowserNetworkManager {
 	};
 
 	readonly #onResponse = (response: HTTPResponse): void => {
+		this.#pendingNavigations.delete(response.request());
 		const record = (response.request() as RequestWithRecord)[REQUEST_RECORD];
 		if (!record) return;
 		record.response = response;
@@ -215,12 +227,14 @@ export class BrowserNetworkManager {
 	};
 
 	readonly #onRequestFinished = (request: HTTPRequest): void => {
+		this.#pendingNavigations.delete(request);
 		const record = (request as RequestWithRecord)[REQUEST_RECORD];
 		if (!record) return;
 		record.durationMs = Math.max(0, Date.now() - record.ts);
 	};
 
 	readonly #onRequestFailed = (request: HTTPRequest): void => {
+		this.#pendingNavigations.delete(request);
 		const record = (request as RequestWithRecord)[REQUEST_RECORD];
 		if (!record) return;
 		record.failureText ??= request.failure()?.errorText ?? "request failed";
@@ -251,6 +265,7 @@ export class BrowserNetworkManager {
 		this.#page.off("response", this.#onResponse);
 		this.#page.off("requestfinished", this.#onRequestFinished);
 		this.#page.off("requestfailed", this.#onRequestFailed);
+		this.#pendingNavigations.clear();
 		if (this.#interceptionEnabled && !this.#page.isClosed()) {
 			await this.#page.setRequestInterception(false).catch(() => undefined);
 		}
@@ -260,6 +275,11 @@ export class BrowserNetworkManager {
 	/** Whether routes or allowed domains require interception to remain enabled between runs. */
 	hasPersistentInterception(): boolean {
 		return this.#allowedDomains.length > 0 || this.#routes.length > 0;
+	}
+
+	/** Whether a main-frame navigation request is still waiting for its response. */
+	hasPendingMainFrameNavigation(): boolean {
+		return this.#pendingNavigations.size > 0;
 	}
 
 	/** Restore the interception state after raw page interception used by one run. */
@@ -476,7 +496,7 @@ export function buildHarEntry(
 			queryString: queryStringToHar(record.url),
 			cookies: [],
 			headersSize: -1,
-			bodySize: record.sizes.requestBody,
+			bodySize: record.sizes.requestBody ?? -1,
 		},
 		response: {
 			status: record.status ?? 0,

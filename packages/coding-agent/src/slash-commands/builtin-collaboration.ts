@@ -12,7 +12,7 @@ import { theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../modes/types";
 import { sanitizeDisplayLine } from "@oh-my-pi/pi-tui/overlays/extensions/display-text";
 import { extractLastCodeBlock, extractLastCommand, extractLastLink } from "@oh-my-pi/pi-tui/overlays/copy-targets";
-import { restartBrowserForModeChange } from "../tools/browser";
+import { applyBrowserModeChange } from "../tools/browser";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 import { openPath } from "../utils/open";
 import { copyToClipboard } from "../utils/clipboard";
@@ -232,18 +232,25 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 		icon: "clipboard",
 		description: "Copy session transcript to clipboard (and write LLM request JSON to tmp)",
 		acpDescription: "Return full transcript as plain text, with LLM request JSON path",
-		acpInputHint: "[all]",
+		acpInputHint: "[all|anon]",
 		subcommands: [
 			{
 				name: "all",
 				description: "Write a zip with the main transcript, LLM request JSON, and one file per subagent",
 			},
+			{
+				name: "anon",
+				description: "Write a zip of anonymized session JSONL (contents redacted, metadata kept) plus subagents",
+			},
 		],
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const { verb } = parseSubcommand(command.args);
-			if (verb === "all") {
-				const archive = await runtime.session.dumpSessionArchiveToTmpDir();
+			if (verb === "all" || verb === "anon") {
+				const archive =
+					verb === "all"
+						? await runtime.session.dumpSessionArchiveToTmpDir()
+						: await runtime.session.dumpAnonymizedArchiveToTmpDir();
 				if (!archive) {
 					await runtime.output("No messages to dump yet.");
 					return commandConsumed();
@@ -251,7 +258,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 				await runtime.output(formatDumpArchiveReport(archive).join("\n"));
 				return commandConsumed();
 			}
-			if (verb) return usage("Usage: /dump [all]", runtime);
+			if (verb) return usage("Usage: /dump [all|anon]", runtime);
 			const text = runtime.session.formatSessionAsText();
 			if (!text) {
 				await runtime.output("No messages to dump yet.");
@@ -276,7 +283,8 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 		handleTui: async (command, runtime) => {
 			const { verb } = parseSubcommand(command.args);
 			if (verb === "all") await runtime.ctx.handleDumpAllCommand();
-			else if (verb) runtime.ctx.showStatus("Usage: /dump [all]");
+			else if (verb === "anon") await runtime.ctx.handleDumpAnonCommand();
+			else if (verb) runtime.ctx.showStatus("Usage: /dump [all|anon]");
 			else await runtime.ctx.handleDumpCommand();
 			clearSubmittedText(runtime);
 		},
@@ -519,12 +527,12 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 			else return usage("Usage: /browser [headless|visible]", runtime);
 			cfgBrowserHeadless.set(runtime.settings, next);
 			try {
-				await restartBrowserForModeChange();
+				await applyBrowserModeChange(next);
 			} catch (err) {
-				// Setting was already mutated; surface the restart failure so the
+				// Setting was already mutated; surface the failure so the
 				// user knows the browser is in an inconsistent state.
 				await runtime.output(
-					`Browser mode set to ${next ? "headless" : "visible"}, but restart failed: ${errorMessage(err)}`,
+					`Browser mode set to ${next ? "headless" : "visible"}, but applying it failed: ${errorMessage(err)}`,
 				);
 				return commandConsumed();
 			}
@@ -553,9 +561,9 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 			}
 			cfgBrowserHeadless.set(settings, next);
 			try {
-				await restartBrowserForModeChange();
+				await applyBrowserModeChange(next);
 			} catch (error) {
-				runtime.ctx.showWarning(`Failed to restart browser: ${errorMessage(error)}`);
+				runtime.ctx.showWarning(`Failed to apply the browser mode: ${errorMessage(error)}`);
 				clearSubmittedText(runtime);
 				return;
 			}

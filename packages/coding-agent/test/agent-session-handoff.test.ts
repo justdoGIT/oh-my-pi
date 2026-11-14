@@ -178,8 +178,8 @@ describe("AgentSession handoff", () => {
 		session.agent.getApiKey = () => "test-key";
 		const enteredAdmission = Promise.withResolvers<void>();
 		let admissionSettled = false;
-		const waitForCleanup = SessionMaintenance.prototype.waitForManualMaintenanceCleanup;
-		vi.spyOn(SessionMaintenance.prototype, "waitForManualMaintenanceCleanup").mockImplementation(
+		const waitForCleanup = SessionMaintenance.prototype.waitForMaintenanceCleanup;
+		vi.spyOn(SessionMaintenance.prototype, "waitForMaintenanceCleanup").mockImplementation(
 			function (this: SessionMaintenance) {
 				const waiting = waitForCleanup.call(this);
 				enteredAdmission.resolve();
@@ -401,6 +401,10 @@ describe("AgentSession handoff", () => {
 					truncatedChars: 0,
 					text: `archived ${HANDOFF_SECRET}`,
 					textHead: `head ${HANDOFF_SECRET}`,
+					withoutThinking: {
+						summary: `variant summary ${HANDOFF_SECRET}`,
+						archive: { frames: [], totalChars: 16, truncatedChars: 0, text: `variant ${HANDOFF_SECRET}` },
+					},
 				},
 			},
 			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
@@ -423,10 +427,13 @@ describe("AgentSession handoff", () => {
 		if (!preserve) throw new Error("Expected previousPreserveData");
 		// The archive plaintext that compact() migrates into the summary prompt is
 		// redacted, so the raw secret never reaches the provider.
-		const archive = preserve[snapcompact.PRESERVE_KEY] as { text: string; textHead: string };
+		const archive = snapcompact.getPreservedArchive(preserve)!;
 		expect(archive.text).toBe(`archived ${placeholder}`);
 		expect(archive.textHead).toBe(`head ${placeholder}`);
-		expect(JSON.stringify(archive)).not.toContain(HANDOFF_SECRET);
+		// So is the no-reasoning variant a Claude summarizer reads instead.
+		expect(archive.withoutThinking?.summary).toBe(`variant summary ${placeholder}`);
+		expect(archive.withoutThinking?.archive.text).toBe(`variant ${placeholder}`);
+		expect(JSON.stringify(preserve[snapcompact.PRESERVE_KEY])).not.toContain(HANDOFF_SECRET);
 		// Opaque provider-replay state stays byte-identical (same reference) — only the
 		// snapcompact slot's text is rewritten.
 		expect(preserve.openaiRemoteCompaction).toBe(replaySlot);
@@ -456,7 +463,7 @@ describe("AgentSession handoff", () => {
 		const compactSpy = vi.spyOn(compactionModule, "compact").mockRejectedValue(new Error("429 quota exhausted"));
 
 		await expect(session.compact(undefined, { mode: "snapcompact" })).rejects.toThrow(
-			"snapcompact cannot render this conversation locally",
+			"snapcompact cannot render this conversation",
 		);
 
 		expect(compactSpy).not.toHaveBeenCalled();
@@ -1429,5 +1436,61 @@ describe("AgentSession handoff", () => {
 
 		const result = await session.handoff(undefined, { autoTriggered: true });
 		expect(result).toBeUndefined();
+	});
+
+	it("rejects a final answer instead of committing it as a manual handoff", async () => {
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue(
+			"I've read both files completely. Here are the exact texts.",
+		);
+
+		await expect(session.handoff()).rejects.toThrow("Handoff generation produced an invalid document");
+		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(false);
+	});
+
+	it("accepts a handoff document whose Goal section follows a title line", async () => {
+		const handoffText = "# Handoff\n\n## Goal\nContinue from here";
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue(handoffText);
+
+		const result = await session.handoff();
+
+		expect(result?.document).toBe(handoffText);
+		const compaction = sessionManager.getBranch().findLast(entry => entry.type === "compaction");
+		if (compaction?.type !== "compaction") throw new Error("Expected handoff compaction entry");
+		expect(compaction.summary).toContain(handoffText);
+	});
+
+	it("falls back from malformed auto-handoff to soft compaction", async () => {
+		cfgCompactionMethodOrder.set(session.settings, ["handoff", "soft"]);
+		cfgCompactionHandoffSaveToDisk.set(session.settings, true);
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue(
+			"Let me find where the message was created.",
+		);
+		const lastEntryId = sessionManager.getBranch().at(-1)?.id;
+		if (!lastEntryId) throw new Error("Expected seeded history");
+		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue({
+			firstKeptEntryId: lastEntryId,
+			messagesToSummarize: [{ role: "user", content: "original goal", timestamp: 1 }],
+			turnPrefixMessages: [],
+			recentMessages: [],
+			isSplitTurn: false,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: compactionModule.DEFAULT_COMPACTION_SETTINGS,
+		});
+		vi.spyOn(compactionModule, "compact").mockResolvedValue({
+			summary: "## Goal\nFollow the original read-only request",
+			shortSummary: undefined,
+			firstKeptEntryId: lastEntryId,
+			tokensBefore: 100,
+			details: {},
+		});
+
+		await session.runIdleCompaction();
+
+		const compaction = sessionManager.getBranch().findLast(entry => entry.type === "compaction");
+		expect(compaction).toMatchObject({ type: "compaction", method: "soft" });
+		if (compaction?.type !== "compaction") throw new Error("Expected soft compaction");
+		expect(compaction.summary).toContain("Follow the original read-only request");
+		expect(compaction.summary).not.toContain("Let me find");
 	});
 });

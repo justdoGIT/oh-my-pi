@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { AuthStorage } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { runSearchQuery } from "@oh-my-pi/pi-coding-agent/web/search";
+import { runSearchQuery, type SearchQueryParams } from "@oh-my-pi/pi-coding-agent/web/search";
 import type { SearchParams } from "@oh-my-pi/pi-coding-agent/web/search/provider";
 import * as provider from "@oh-my-pi/pi-coding-agent/web/search/provider";
 import type { SearchProviderId, SearchResponse, SearchSource } from "@oh-my-pi/pi-coding-agent/web/search/types";
@@ -77,6 +77,64 @@ describe("web search directive pipeline", () => {
 		expect(result.content[0]?.text).toStartWith(
 			"Note: no results matched `site:nowhere.example`; the constraint was relaxed",
 		);
+	});
+
+	it.each<[string, string, SearchProviderId]>([
+		["routes an X-only query to xAI ahead of the role's engine", "tern site:x.com", "xai"],
+		["keeps the role's engine for queries that are not X-only", "tern site:x.com site:github.com", "brave"],
+	])("%s", async (_caseName, query, expectedProvider) => {
+		const context = await stubRoleProvider("brave", async () => ({ provider: "brave", sources: SOURCES }));
+		context.authStorage.keys.setRuntime("xai", "test-xai-key");
+		vi.spyOn(provider, "getGroundedSearchProvider").mockImplementation(async grounding => ({
+			id: "xai",
+			label: grounding,
+			isAvailable: () => true,
+			isExplicitlyAvailable: () => true,
+			search: async () => ({ provider: "xai", sources: [{ title: "Post", url: "https://x.com/jack/status/20" }] }),
+		}));
+
+		const result = await runSearchQuery({ query }, context);
+
+		expect(result.details.response.provider).toBe(expectedProvider);
+	});
+
+	it.each<[string, SearchQueryParams, SearchProviderId]>([
+		[
+			"routes a Hacker News-only query to the HN engine ahead of the role's engine",
+			{ query: "tern site:news.ycombinator.com/item" },
+			"hackernews",
+		],
+		[
+			"keeps the role's engine when another site shares the query",
+			{ query: "tern site:news.ycombinator.com site:github.com" },
+			"brave",
+		],
+		[
+			"keeps a per-request model selector for a Hacker News-only query",
+			{ query: "tern site:news.ycombinator.com", model: "web/brave" },
+			"brave",
+		],
+	])("%s", async (_caseName, params, expectedProvider) => {
+		const context = await stubRoleProvider("brave", async () => ({ provider: "brave", sources: SOURCES }));
+		const brave = await provider.getSearchProvider("brave");
+		context.getProvider.mockImplementation(async requested => {
+			if (requested === "brave") return brave;
+			if (requested !== "hackernews") throw new Error(`Unexpected provider: ${requested}`);
+			return {
+				id: "hackernews",
+				label: "Hacker News",
+				isAvailable: () => true,
+				isExplicitlyAvailable: () => true,
+				search: async () => ({
+					provider: "hackernews",
+					sources: [{ title: "Thread", url: "https://news.ycombinator.com/item?id=1" }],
+				}),
+			};
+		});
+
+		const result = await runSearchQuery(params, context);
+
+		expect(result.details.response.provider).toBe(expectedProvider);
 	});
 
 	it("uses a request model override instead of modelRoles.web", async () => {
