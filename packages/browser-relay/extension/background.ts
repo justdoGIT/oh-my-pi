@@ -162,30 +162,28 @@ function post(msg: ExtToRelayMessage): void {
 	if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
-/** Chrome can refuse a tab close for a moment (a tab being dragged, an unload in progress); try again before failing. */
-async function removeTab(tabId: number): Promise<void> {
-	for (let attempt = 1; ; attempt++) {
-		try {
-			await chrome.tabs.remove(tabId);
-			return;
-		} catch (error) {
-			// Already closed: the close the relay asked for has happened.
-			if (/No tab with id/.test(String(error))) return;
-			if (attempt >= REMOVE_TAB_ATTEMPTS) throw error;
-			const pause = Promise.withResolvers<void>();
-			setTimeout(pause.resolve, REMOVE_TAB_RETRY_MS);
-			await pause.promise;
-		}
-	}
-}
-
-async function setBadge(connected: boolean): Promise<void> {
+function setBadge(connected: boolean): void {
 	try {
-		await chrome.action.setBadgeText({ text: connected ? "on" : "off" });
-		await chrome.action.setBadgeBackgroundColor({ color: connected ? "#1a7f37" : "#8b8b8b" });
-	} catch {
-		// Badge is cosmetic; never let it break the relay loop.
-	}
+		type ChromeWithActions = { action?: typeof chrome.action; browserAction?: typeof chrome.action };
+		const action = (chrome as unknown as ChromeWithActions)?.action ?? (chrome as unknown as ChromeWithActions)?.browserAction;
+		if (!action) return;
+		if (typeof action.setBadgeText === "function") {
+			try {
+				action.setBadgeText({ text: connected ? "on" : "off" }, () => {
+					const _ = chrome?.runtime?.lastError;
+				});
+			} catch {}
+		}
+
+		if (typeof action.setBadgeBackgroundColor === "function") {
+			try {
+				const color = connected ? [26, 127, 55, 255] : [139, 139, 139, 255];
+				action.setBadgeBackgroundColor({ color }, () => {
+					const _ = chrome?.runtime?.lastError;
+				});
+			} catch {}
+		}
+	} catch {}
 }
 
 async function buildHello(): Promise<ExtToRelayMessage> {
@@ -288,7 +286,14 @@ async function connect(): Promise<void> {
 	if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 	const settings = await loadSettings();
 	const url = `ws://127.0.0.1:${settings.port}/ext${settings.token ? `?token=${encodeURIComponent(settings.token)}` : ""}`;
-	const socket = new WebSocket(url);
+	let socket: WebSocket;
+	try {
+		socket = new WebSocket(url);
+	} catch {
+		void setBadge(false);
+		scheduleReconnect();
+		return;
+	}
 	ws = socket;
 	socket.onopen = () => {
 		reconnectDelay = RECONNECT_MIN_MS;

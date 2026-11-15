@@ -6,6 +6,10 @@
 	"author": "Stencil Labs, Inc.",
 	"homepage_url": "https://omp.sh",
 	"permissions": ["debugger", "tabs", "tabGroups", "storage", "alarms"],
+	"host_permissions": [
+		"http://127.0.0.1/*",
+		"http://localhost/*"
+	],
 	"background": {
 		"service_worker": "background.js"
 	},
