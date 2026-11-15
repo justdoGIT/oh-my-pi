@@ -36,6 +36,14 @@ export interface MessageStats {
 	/** Which agent produced this message (main agent, task subagent, advisor) */
 	agentType: AgentType;
 	/**
+	 * Service tier the provider reported serving this turn, or `null` when the
+	 * provider reported none. Lets consumers separate a fast serving path's
+	 * throughput and premium traffic from standard-tier traffic. Always written by
+	 * `rowToMessageStats`; optional only because session fixtures that stand in
+	 * for ingest input are typed as `MessageStats` too.
+	 */
+	serviceTier?: ServiceTier | null;
+	/**
 	 * Ingest refused to price this request: a scheduled (time-based) card with no
 	 * recoverable request timestamp, so `usage.cost.total` of 0 is unknown spend
 	 * rather than a free request. Always written by `rowToMessageStats`; optional
@@ -63,7 +71,7 @@ export interface MessageStatsInput extends Omit<MessageStats, "usage" | "costUnp
 export interface RequestDetails extends MessageStats {
 	/** The full conversation history or just the last turn. */
 	messages: unknown[];
-	/** The model's response. */
+	/** The model's response; `null` for `model_usage` entries, which journal no payload. */
 	output: unknown;
 }
 
@@ -175,14 +183,18 @@ export interface UserMessageStats {
 	repetition: number;
 	/** Second-person reproach ("you didnt", "why did you", "stop X-ing") */
 	blame: number;
+	/** Judge-facing prose (see `judgeProse`); empty when the message was all markup. */
+	prose: string;
+	/** Hex `Bun.hash` of `prose`, keying the shared verdict cache; empty when `prose` is. */
+	proseHash: string;
 }
 
 /**
- * Pair emitted by the parser when it sees an assistant message whose
- * `parentId` points to a user message that wasn't parsed in the same pass
- * (e.g. user prompt landed in an earlier incremental sync). The aggregator
- * applies the link to the persisted `user_messages` row so it stops showing
- * up in the "unknown" model bucket.
+ * Pair emitted by the parser for each assistant message that answers a user
+ * message: the first assistant message descending from it through non-message
+ * entries, whether the user message was parsed in this pass or an earlier one.
+ * The aggregator applies the link to the persisted `user_messages` row so it
+ * stops showing up in the "unknown" model bucket.
  */
 export interface UserMessageLink {
 	sessionFile: string;
@@ -219,12 +231,17 @@ export interface ToolCallStats {
 	callsInTurn: number;
 	/** Serialized argument characters */
 	argsChars: number;
+	/** Result text characters, when the same parse also read the call's `toolResult` */
+	resultChars?: number;
+	/** Result error flag, set together with `resultChars` */
+	isError?: boolean;
 }
 
 /**
  * Result linkage emitted when the parser sees a `toolResult` message entry.
  * Applied as an UPDATE on the persisted tool-call row — results can land in a
- * later incremental sync pass than the call that produced them.
+ * later incremental sync pass than the call that produced them (calls parsed
+ * in the same pass already carry the result, so their UPDATE is a no-op).
  */
 export interface ToolResultLink {
 	sessionFile: string;

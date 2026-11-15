@@ -1,6 +1,6 @@
 # @oh-my-pi/pi-mnemopi
 
-Local SQLite memory engine for Oh My Pi agents.
+Local SQLite memory engine for omp agents.
 
 This package is the Bun/TypeScript port of the Mnemosyne memory engine. It provides:
 
@@ -28,6 +28,8 @@ console.log(id, results[0]?.content);
 
 memory.close();
 ```
+
+Lexical recall matches whole tokens, declared synonyms, underscore-separated identifier parts, and other forms of a word of at least four characters: the word plus `s`, `es`, `d`, `ed`, `ing`, `er`, `ers`, `ment` or `ments`, a final `e` replaced by `ing`/`ion`/`ions`, or a final `y` replaced by `ies`/`ied`. `backup` matches `backups`, `facts` matches `fact` and `caching` matches `cache`, but `1Password` does not match `pass` or `word`, and `redis` does not match `redistribution`.
 
 ## Configuration
 
@@ -72,7 +74,7 @@ const dynamicLlm = new Mnemopi({
 
 `Mnemopi` itself exposes banks directly through constructor options such as `bank`; it does not hard-code coding-agent project scoping.
 
-The Oh My Pi coding-agent wrapper adds `mnemopi.scoping` on top of those constructor options:
+The omp coding-agent wrapper adds `mnemopi.scoping` on top of those constructor options:
 
 - `global`: one shared bank
 - `per-project`: isolated project memory
@@ -87,6 +89,7 @@ Common environment fallbacks:
 - `MNEMOPI_NO_EMBEDDINGS=1`: force FTS-only recall.
 - `MNEMOPI_EMBEDDING_MODEL`: defaults to `BAAI/bge-small-en-v1.5`.
 - `MNEMOPI_EMBEDDING_API_URL` and `MNEMOPI_EMBEDDING_API_KEY`: OpenAI-compatible embedding endpoint.
+- `MNEMOPI_EMBEDDING_BATCH_SIZE`: texts per embedding API request, default `64`. Larger inputs are split into several requests. Set it lower for a provider with a smaller per-request limit, for example `10` for DashScope.
 - `MNEMOPI_LLM_ENABLED=1`, `MNEMOPI_LLM_BASE_URL`, `MNEMOPI_LLM_API_KEY`, `MNEMOPI_LLM_MODEL`: OpenAI-compatible LLM endpoint.
 
 Local embeddings use the `fastembed` npm package. Its default `BGESmallENV15` model is 384-dimensional and uses the package's CLS pooling plus vector normalization path. Local GGUF LLMs are not available in this package.

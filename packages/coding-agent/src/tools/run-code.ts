@@ -1,4 +1,4 @@
-import { ToolError } from "./tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 const NON_SERIALIZABLE_RUN_ARGUMENT = "Run argument is not JSON-serializable; pass plain data";
 
@@ -53,6 +53,39 @@ export function renderRunArg(value: unknown): string {
 	}
 	if (rendered === undefined) throw new ToolError(NON_SERIALIZABLE_RUN_ARGUMENT);
 	return rendered;
+}
+
+/** Renders a helper call chain (`id(5).click()`) with arguments as JavaScript literals. */
+export function renderCallChain(chain: readonly { method: string; args: readonly unknown[] }[]): string {
+	return chain.map(step => `${step.method}(${step.args.map(renderRunArg).join(", ")})`).join(".");
+}
+
+/** One step of a helper call chain: `id(5)` in `id(5).click()`. */
+export interface CallStep {
+	method: string;
+	args: readonly unknown[];
+}
+
+/**
+ * Renders a call chain for a status line, which the session file keeps and the terminal shows:
+ * {@link renderCallChain}, except that text a helper enters into a page or an app, often a
+ * credential, is shown as `<hidden>`. `textStart` gives the index of the first argument that
+ * carries entered text (every later one is hidden too, since Python passes keywords as a trailing
+ * object), or `undefined` for a step that enters none.
+ */
+export function renderStatusCallChain(
+	chain: readonly CallStep[],
+	textStart: (step: CallStep, index: number) => number | undefined,
+): string {
+	return chain
+		.map((step, index) => {
+			const start = textStart(step, index);
+			const args = step.args.map((arg, position) =>
+				start !== undefined && position >= start ? "<hidden>" : renderRunArg(arg),
+			);
+			return `${step.method}(${args.join(", ")})`;
+		})
+		.join(".");
 }
 
 /** Renders a function invocation with the requested run scope and positional arguments. */

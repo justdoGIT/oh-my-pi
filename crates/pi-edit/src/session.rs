@@ -9,13 +9,18 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 
 use crate::{
-	diff_string::{CompactDiffOptions, build_compact_diff_preview},
-	engine::{EditMode, FileOp, HeaderKind, ModeEngine, PreviewFile, StagedFile},
+	diff_string::{
+		BlockContextSource, CompactDiffOptions, build_compact_diff_preview, generate_diff_string,
+	},
+	engine::{
+		EditMode, FileOp, FileOpIntent, HeaderKind, ModeEngine, PreviewFile, Resolved, StagedFile,
+	},
 	error::{EditError, EditResult},
 	files::{FileCache, FileSource},
+	modes::hashline::syntax::has_syntax_oracle,
 	notebook,
-	path_policy::{PathPolicy, canonical_key},
-	store::{EditStore, file_hash},
+	path_policy::{PathPolicy, UrlResolution, canonical_key},
+	store::{EditStore, file_hash, seen_lines_from_body},
 	stream_json::ArgStream,
 	text::{normalize_to_lf, strip_bom, utf16_len},
 };
@@ -28,6 +33,10 @@ pub struct SessionConfig {
 	pub allow_fuzzy:        bool,
 	pub fuzzy_threshold:    f64,
 	pub enforce_seen_lines: bool,
+	/// Narrowest per-line display cap any tool applies, in UTF-8 bytes (0: no
+	/// tool cuts lines). Without recorded read provenance, hashline anchors on
+	/// longer lines are rejected because their display may have been cut.
+	pub max_columns:        usize,
 	/// The payload is not JSON (custom-format tool): the buffer is `input`.
 	pub raw_input:          bool,
 }
@@ -119,6 +128,11 @@ pub const MAX_EDIT_SNAPSHOT_TEXT_CHARS: usize = 32_768;
 /// Separates completed edit sections in model-visible tool output.
 pub const EDIT_RESULT_SEPARATOR: &str = "\n\n";
 
+/// Written rows kept on each side of a collapsed run in an edit response. The
+/// response is where the next edit takes its numbers, and only displayed rows
+/// count as seen, so a run of up to `2 * N + 1` rows renders whole.
+const RESPONSE_ADDED_RUN_CONTEXT_LINES: usize = 20;
+
 /// Per-call edit session.
 pub struct Session {
 	config:          SessionConfig,
@@ -130,6 +144,8 @@ pub struct Session {
 	/// Generation the last preview was computed for.
 	previewed:       u32,
 	final_pass_done: bool,
+	/// Apply began: URL answers provided from here on belong to apply.
+	applying:        bool,
 }
 
 impl Session {
@@ -139,6 +155,7 @@ impl Session {
 			config.allow_fuzzy,
 			config.fuzzy_threshold,
 			config.enforce_seen_lines,
+			config.max_columns,
 		);
 		let files = FileCache::new(config.policy.clone());
 		Self {
@@ -150,6 +167,7 @@ impl Session {
 			generation: 0,
 			previewed: 0,
 			final_pass_done: false,
+			applying: false,
 		}
 	}
 
@@ -192,6 +210,98 @@ impl Session {
 		self.generation != self.previewed || (self.args.is_finished() && !self.final_pass_done)
 	}
 
+	/// Drain internal URLs that missed the resolution table since the last
+	/// call (deduped, first-seen order). Streaming passes record misses too:
+	/// the host answers half-streamed URLs like any other (locating has no
+	/// side effects), so previews never wait for the arguments to finish.
+	pub fn take_unresolved(&mut self) -> Vec<String> {
+		self.files.take_unresolved()
+	}
+
+	/// Record the host answer for `url`; clears cached reads/resolutions for
+	/// it and makes [`Self::preview_pending`] true. Answers provided before
+	/// the apply phase serve previews only.
+	pub fn provide(&mut self, url: String, resolution: UrlResolution) {
+		self.files.provide(url, resolution);
+		self.generation += 1;
+	}
+
+	/// Drain authored paths that were missing on disk, with no recovery
+	/// answer yet, since the last call (deduped, first-seen order). Passes
+	/// treat them as not recovered; the host searches the working tree for a
+	/// unique suffix match, [`Self::provide_recovery`]s each answer, and
+	/// reruns the pass.
+	pub fn take_recovery_misses(&mut self) -> Vec<String> {
+		self.files.take_recovery_misses()
+	}
+
+	/// Record the host's recovery answer for the missing `authored` path
+	/// (`None`: no unique match) and make [`Self::preview_pending`] true.
+	/// Answers provided before the apply phase serve previews only.
+	pub fn provide_recovery(&mut self, authored: String, answer: Option<Resolved>) {
+		self.files.provide_recovery(authored, answer);
+		self.generation += 1;
+	}
+
+	/// Enter the apply phase (idempotent), stage the finished arguments in
+	/// memory without writing, and list the authored paths that were missing
+	/// on disk with no recovery answer, so the host can answer them before
+	/// [`Self::apply`] writes anything. Staging failures are left for
+	/// [`Self::apply`] to raise. Empty while the arguments are incomplete.
+	pub fn apply_recovery_misses(&mut self) -> Vec<String> {
+		self.begin_apply();
+		self.files.clear();
+		let snapshot = self.args.snapshot();
+		if !snapshot.complete {
+			return Vec::new();
+		}
+		// A probe: staging into the live store would record what a rejection
+		// reveals (unseen lines become seen, so the real apply passes the
+		// guard) and move clipboard registers.
+		let _ = self
+			.engine
+			.stage(&snapshot, &mut self.files, &self.store.fork());
+		self.files.take_recovery_misses()
+	}
+
+	/// Enter the apply phase (idempotent) and list the internal URL targets
+	/// the finished arguments name — section paths and move destinations,
+	/// deduped in payload order — so the host can answer them all in one
+	/// pass before [`Self::apply`] instead of one staging retry per URL.
+	/// Entering the phase drops every preview-time answer: those were
+	/// resolved before approval and without the call's abort signal. Empty
+	/// while the arguments are incomplete.
+	pub fn begin_apply_url_targets(&mut self) -> Vec<String> {
+		self.begin_apply();
+		let snapshot = self.args.snapshot();
+		if !snapshot.complete {
+			return Vec::new();
+		}
+		let inspection = self.engine.inspect(&snapshot);
+		let moves = inspection.file_ops.iter().filter_map(|op| match op {
+			FileOpIntent::Move { to, .. } => Some(to),
+			FileOpIntent::Delete { .. } => None,
+		});
+		let policy = &self.config.policy;
+		let mut targets: Vec<String> = Vec::new();
+		for authored in inspection.paths.iter().chain(moves) {
+			if let Some(url) = policy.url_target(authored)
+				&& !targets.iter().any(|known| *known == url)
+			{
+				targets.push(url.into_owned());
+			}
+		}
+		targets
+	}
+
+	/// Switch to the apply phase once, forgetting preview-time URL answers.
+	fn begin_apply(&mut self) {
+		if !self.applying {
+			self.applying = true;
+			self.files.forget_answers();
+		}
+	}
+
 	/// Compute the preview for the current buffer. While streaming, trailing
 	/// removal-only tails are trimmed so additions never visibly "catch up".
 	pub fn preview(&mut self) -> PreviewBatch {
@@ -220,12 +330,19 @@ impl Session {
 	/// failure aborts before the first write), enforce the plan-mode guard
 	/// for every file, then write in payload order. A writer failure aborts
 	/// the loop; files already written stay written and the error is
-	/// returned verbatim.
+	/// returned verbatim. URL targets never reuse preview-time answers (see
+	/// [`Self::begin_apply_url_targets`]).
+	///
+	/// # Errors
+	/// Staging and plan-mode failures, all raised before the first write —
+	/// including [`EditError::UnresolvedUrl`], after which the host may
+	/// [`Self::provide`] the URL and retry — or the writer's error.
 	pub async fn apply(
 		&mut self,
 		request: ApplyRequest,
 		writer: &dyn EditWriter,
 	) -> EditResult<ApplyOutcome> {
+		self.begin_apply();
 		self.files.clear();
 		let snapshot = self.args.snapshot();
 		if !snapshot.complete {
@@ -233,7 +350,7 @@ impl Session {
 		}
 		let staged = self.engine.stage(&snapshot, &mut self.files, &self.store)?;
 		for file in &staged {
-			self.config.policy.enforce_write(
+			self.files.enforce_write(
 				&file.display,
 				file.op,
 				file.move_to.as_ref().map(|m| m.display.as_str()),
@@ -261,6 +378,9 @@ impl Session {
 			};
 
 			let mut tag: Option<String> = None;
+			// Updated files register their response rows against the minted tag
+			// (the store carries still-valid prior provenance): the store key.
+			let mut provenance: Option<PathBuf> = None;
 			match file.op {
 				FileOp::Delete => self.store.invalidate(&canonical),
 				FileOp::Noop => {
@@ -270,16 +390,41 @@ impl Session {
 				},
 				FileOp::Create | FileOp::Update => {
 					let dest_canonical = file.move_to.as_ref().map(|m| canonical_key(&m.absolute));
+					let track_provenance = file.record_snapshot
+						&& file.op == FileOp::Update
+						&& file.header == HeaderKind::HashlineTag;
 					if let Some(dest) = &dest_canonical {
 						self.store.relocate(&canonical, dest);
 					}
 					if file.record_snapshot {
 						let recorded = recorded_view(&file, &response.written);
-						if dest_canonical.is_none() && recorded != file.after {
-							file.warnings.push(write_drift_warning(&file.display));
+						if recorded != file.after {
+							// The host reformatted the write (LSP format-on-write,
+							// editor format-on-save): render the result from what
+							// landed so the rows match the tag minted below.
+							if dest_canonical.is_none() {
+								file.warnings.push(write_drift_warning(&file.display));
+							}
+							let diff =
+								generate_diff_string(&file.before, &recorded, None, &BlockContextSource {
+									path:      Some(&file.display),
+									lang:      None,
+									streaming: false,
+								});
+							file.diff = diff.diff;
+							file.preview_diff = None;
+							file.first_changed_line = diff.first_changed_line;
+							file.after = recorded;
 						}
-						let key = dest_canonical.as_deref().unwrap_or(&canonical);
-						tag = Some(self.store.record(key, &recorded, None));
+						let key = dest_canonical.unwrap_or_else(|| canonical.clone());
+						tag = Some(if track_provenance {
+							self.store.record_edit(&key, &file.before, &file.after)
+						} else {
+							self.store.record(&key, &file.after, None)
+						});
+						if track_provenance {
+							provenance = Some(key);
+						}
 					}
 					self.store.reset_noop(&canonical);
 				},
@@ -292,14 +437,20 @@ impl Session {
 				.move_to
 				.as_ref()
 				.map_or(file.display.as_str(), |m| m.display.as_str());
-			let header = match file.header {
-				HeaderKind::HashlineTag => {
-					let tag = tag.unwrap_or_else(|| file_hash(&file.after));
-					format!("[{header_path}#{tag}]")
-				},
-				HeaderKind::Path => format!("[{header_path}]"),
+			let response_tag = match file.header {
+				HeaderKind::HashlineTag => Some(tag.unwrap_or_else(|| file_hash(&file.after))),
+				HeaderKind::Path => None,
 			};
+			let header = response_tag
+				.as_ref()
+				.map_or_else(|| format!("[{header_path}]"), |tag| format!("[{header_path}#{tag}]"));
 			let text = format_file_text(&file, &header);
+			if let (Some(key), Some(tag)) = (provenance, &response_tag) {
+				let seen_lines = seen_lines_from_body(&text);
+				if !seen_lines.is_empty() {
+					self.store.record_seen_lines(&key, tag, &seen_lines);
+				}
+			}
 			let parse_regressed = file.op != FileOp::Delete
 				&& file.op != FileOp::Noop
 				&& file.existed
@@ -365,29 +516,34 @@ fn format_file_text(file: &StagedFile, header: &str) -> String {
 	if let Some(text) = &file.text_override {
 		return text.clone();
 	}
-	if file.op == FileOp::Delete {
-		return format!("Deleted {}", file.display);
-	}
-	let preview_source = file.preview_diff.as_deref().unwrap_or(&file.diff);
-	let preview = build_compact_diff_preview(preview_source, &CompactDiffOptions::default()).preview;
-	let mut lines: Vec<&str> = vec![header];
-	lines.extend(file.before_preview.iter().map(String::as_str));
-	let moved = file
-		.move_to
-		.as_ref()
-		.map(|m| format!("Moved to {}", m.display));
-	if let Some(moved) = &moved {
-		lines.push(moved);
-	}
-	if !preview.is_empty() {
-		lines.push(&preview);
-	}
-	lines.extend(file.after_preview.iter().map(String::as_str));
-	let body = lines
-		.into_iter()
-		.filter(|line| !line.is_empty())
-		.collect::<Vec<_>>()
-		.join("\n");
+	let body = if file.op == FileOp::Delete {
+		format!("Deleted {}", file.display)
+	} else {
+		let preview_source = file.preview_diff.as_deref().unwrap_or(&file.diff);
+		let preview = build_compact_diff_preview(preview_source, &CompactDiffOptions {
+			max_added_run_context: Some(RESPONSE_ADDED_RUN_CONTEXT_LINES),
+			..CompactDiffOptions::default()
+		})
+		.preview;
+		let mut lines: Vec<&str> = vec![header];
+		lines.extend(file.before_preview.iter().map(String::as_str));
+		let moved = file
+			.move_to
+			.as_ref()
+			.map(|m| format!("Moved to {}", m.display));
+		if let Some(moved) = &moved {
+			lines.push(moved);
+		}
+		if !preview.is_empty() {
+			lines.push(&preview);
+		}
+		lines.extend(file.after_preview.iter().map(String::as_str));
+		lines
+			.into_iter()
+			.filter(|line| !line.is_empty())
+			.collect::<Vec<_>>()
+			.join("\n")
+	};
 	let warnings: Vec<&str> = file
 		.warnings
 		.iter()
@@ -417,27 +573,21 @@ fn prune_snapshots(
 /// True when tree-sitter parses `code` (language from `path`) without
 /// errors. Unknown languages never "parse", so they never regress.
 pub fn source_parses(code: &str, path: &str) -> bool {
+	if !has_syntax_oracle(path) {
+		return false;
+	}
 	let code = if code.is_empty() { "\n" } else { code };
-	pi_ast::summary::summarize_code(pi_ast::summary::SummaryOptions {
-		code:               code.to_owned(),
-		lang:               None,
-		path:               Some(path.to_owned()),
-		min_body_lines:     None,
-		min_comment_lines:  None,
-		unfold_until_lines: None,
-		unfold_limit_lines: None,
-	})
-	.is_ok_and(|summary| summary.parsed)
+	pi_ast::summary::parse_code_status(code, None, Some(path))
+		.is_ok_and(|language| language.is_some())
 }
 
-/// The persisted bytes differ from what was sent (an editor reformatted on
-/// save); the recorded snapshot reflects the real file.
+/// The persisted bytes differ from what was sent (LSP format-on-write or an
+/// editor's format-on-save); the result rows and tag reflect the real file.
 pub fn write_drift_warning(path: &str) -> String {
 	format!(
-		"{path}: the file on disk after this write differs from what was sent — the client \
-		 (editor/IDE) likely reformatted it on save (e.g. format-on-save, tab/space settings). The \
-		 returned snapshot reflects the actual file; re-read before further edits if the extra \
-		 changes were unexpected."
+		"{path}: the file on disk after this write differs from what was sent — it was reformatted \
+		 on write (LSP format-on-write, or the client editor's format-on-save). The lines and tag \
+		 above reflect the file as written; anchor further edits on them."
 	)
 }
 
@@ -472,6 +622,78 @@ mod tests {
 		assert_eq!(strip_trailing_unbalanced_removal("+1|a\n-2|b\n-3|c"), "+1|a");
 		assert_eq!(strip_trailing_unbalanced_removal("-2|b"), "");
 		assert_eq!(strip_trailing_unbalanced_removal("-1|a\n+1|b\n 2|c"), "-1|a\n+1|b\n 2|c");
+	}
+
+	fn patch_session(root: &std::path::Path, input: &str) -> Session {
+		let config = SessionConfig {
+			mode:               EditMode::ApplyPatch,
+			policy:             PathPolicy {
+				cwd:                  root.to_owned(),
+				home_dir:             root.to_owned(),
+				url_schemes:          Vec::new(),
+				url_alias_schemes:    Vec::new(),
+				plan_writable_roots:  Vec::new(),
+				plan_active:          false,
+				block_auto_generated: false,
+			},
+			allow_fuzzy:        true,
+			fuzzy_threshold:    0.95,
+			enforce_seen_lines: false,
+			max_columns:        0,
+			raw_input:          false,
+		};
+		let mut session = Session::new(config, EditStore::new());
+		session.set_args_json(&serde_json::json!({ "input": input }).to_string());
+		session.finish();
+		session
+	}
+
+	#[test]
+	fn recovery_answer_feeds_the_rerun_preview() {
+		let tmp = tempfile::tempdir().unwrap();
+		std::fs::create_dir_all(tmp.path().join("deep/src")).unwrap();
+		std::fs::write(tmp.path().join("deep/src/a.ts"), "old\n").unwrap();
+		let mut session = patch_session(
+			tmp.path(),
+			"*** Begin Patch\n*** Update File: src/a.ts\n@@\n-old\n+new\n*** End Patch\n",
+		);
+
+		let missed = session.preview();
+		assert!(missed.files[0].error.is_some(), "{missed:?}");
+		assert_eq!(session.take_recovery_misses(), ["src/a.ts"]);
+
+		session.provide_recovery(
+			"src/a.ts".to_owned(),
+			Some(Resolved {
+				absolute: tmp.path().join("deep/src/a.ts"),
+				display:  "deep/src/a.ts".to_owned(),
+			}),
+		);
+		assert!(session.preview_pending());
+		let recovered = session.preview();
+		assert_eq!(recovered.files[0].display, "deep/src/a.ts");
+		assert!(recovered.files[0].error.is_none(), "{recovered:?}");
+		assert!(session.take_recovery_misses().is_empty());
+	}
+
+	#[test]
+	fn apply_phase_lists_recovery_misses_and_forgets_preview_answers() {
+		let tmp = tempfile::tempdir().unwrap();
+		std::fs::create_dir_all(tmp.path().join("deep/src")).unwrap();
+		std::fs::write(tmp.path().join("deep/src/a.ts"), "old\n").unwrap();
+		let mut session = patch_session(
+			tmp.path(),
+			"*** Begin Patch\n*** Update File: src/a.ts\n@@\n-old\n+new\n*** End Patch\n",
+		);
+		let answer = Resolved {
+			absolute: tmp.path().join("deep/src/a.ts"),
+			display:  "deep/src/a.ts".to_owned(),
+		};
+		session.provide_recovery("src/a.ts".to_owned(), Some(answer.clone()));
+
+		assert_eq!(session.apply_recovery_misses(), ["src/a.ts"]);
+		session.provide_recovery("src/a.ts".to_owned(), Some(answer));
+		assert!(session.apply_recovery_misses().is_empty());
 	}
 
 	#[test]

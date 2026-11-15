@@ -1,0 +1,21 @@
+name: Code scan
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: "47 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    runs-on: ci-standard
+    uses: https://forgejo.kepr.dev/justdoGIT/ci-templates/.forgejo/workflows/reusable-code-scan.yml@1c96fd261aac57dca9471906d02af8fe643b809c

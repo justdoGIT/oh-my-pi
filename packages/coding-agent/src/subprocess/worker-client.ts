@@ -3,13 +3,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	$env,
+	$which,
 	isBunTestRuntime,
 	isCompiledBinary,
+	isExecutable,
+	isFullyQualifiedPath,
 	logger,
 	postmortem,
 	stripWindowsExtendedLengthPathPrefix,
+	WhichCachePolicy,
 	workerHostEntry,
 } from "@oh-my-pi/pi-utils";
+import { stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
 import type { Subprocess } from "bun";
 
 /**
@@ -85,6 +90,12 @@ export interface SpawnedSubprocess<Outbound> {
 	 * wall-clock timers.
 	 */
 	stderrDrained: Promise<void>;
+	/**
+	 * Resolves once the IPC channel closed (the child exited, a SIGKILL included, or either side
+	 * disconnected). Bun hands every message the child sent before that to `inbound` first, so a
+	 * caller that awaits it after a kill has seen the child's last message.
+	 */
+	disconnected: Promise<void>;
 }
 
 /**
@@ -107,6 +118,33 @@ export interface WorkerSpawnCommand {
 export const SMOKE_TEST_TIMEOUT_MS = 30_000;
 
 /**
+ * Resolve the current executable path, falling back to finding the binary on
+ * PATH if the original physical path was unlinked on disk (e.g. Homebrew or a
+ * package manager pruned the prior version directory during an in-flight
+ * upgrade, leaving `process.execPath` pointing at a missing path).
+ */
+export function resolveExecutablePath(): string {
+	const executable = stripWindowsExtendedLengthPathPrefix(process.execPath);
+	if (isCompiledBinary() && !isExecutable(executable)) {
+		const argv0 = stripWindowsExtendedLengthPathPrefix(process.argv0);
+		const isPath = argv0.includes("/") || argv0.includes("\\") || argv0.includes(":");
+		const candidates = [
+			// Prefer the original launcher when invoked with an absolute path
+			isFullyQualifiedPath(argv0) ? argv0 : null,
+			!isPath ? $which(argv0, { requireAbsolutePaths: true, cache: WhichCachePolicy.Bypass }) : null,
+			// Generic fallback to finding "omp" on PATH
+			$which("omp", { requireAbsolutePaths: true, cache: WhichCachePolicy.Bypass }),
+		];
+		for (const candidate of candidates) {
+			if (candidate && isExecutable(candidate)) {
+				return candidate;
+			}
+		}
+	}
+	return executable;
+}
+
+/**
  * Resolve the command that re-enters this CLI's entrypoint: the compiled
  * binary itself, or the runtime plus the declared worker-host entry. Used by
  * the TUI `/restart` relaunch; workers go through {@link resolveWorkerSpawnCmd},
@@ -115,7 +153,7 @@ export const SMOKE_TEST_TIMEOUT_MS = 30_000;
  * absolute path of `src/cli.ts` so the relaunch keeps the caller's cwd.
  */
 export function resolveCliEntryCmd(): string[] {
-	const executable = stripWindowsExtendedLengthPathPrefix(process.execPath);
+	const executable = resolveExecutablePath();
 	if (isCompiledBinary()) return [executable];
 	const hostEntry = workerHostEntry();
 	if (hostEntry) return [executable, hostEntry];
@@ -134,7 +172,7 @@ export function resolveCliEntryCmd(): string[] {
  * IPC handles more reliably under `bun test`.
  */
 export function resolveWorkerSpawnCmd(workerArg: string): WorkerSpawnCommand {
-	const executable = stripWindowsExtendedLengthPathPrefix(process.execPath);
+	const executable = resolveExecutablePath();
 	if (isCompiledBinary()) return { cmd: [executable, workerArg] };
 	const hostEntry = workerHostEntry();
 	if (hostEntry) {
@@ -156,6 +194,9 @@ export function workerEnvFromParent(overlay?: Record<string, string>): Record<st
 		const value = base[key];
 		if (typeof value === "string") merged[key] = value;
 	}
+	// Inherited repo-location overrides must not reach a worker or the PTY
+	// daemons it hosts (issue #11082); an explicit overlay still wins below.
+	stripGitRepoLocationEnv(merged);
 	if (overlay) {
 		for (const key in overlay) merged[key] = overlay[key];
 	}
@@ -223,6 +264,7 @@ export function createWorkerSubprocess<Outbound>(options: {
 	const intentionalExit = { value: false };
 	const stderrTail = new StderrTail(STDERR_TAIL_LIMIT_BYTES);
 	const stderrDrained = Promise.withResolvers<void>();
+	const disconnected = Promise.withResolvers<void>();
 	const stderrCapture = createStderrCapture(options.exitLabel);
 	let stderrDrainStarted = false;
 	// Reassigned once the worker IPC fault handler is registered (after spawn);
@@ -245,6 +287,9 @@ export function createWorkerSubprocess<Outbound>(options: {
 		windowsHide: true,
 		ipc(message) {
 			for (const handler of inbound) handler(message as Outbound);
+		},
+		onDisconnect() {
+			disconnected.resolve();
 		},
 		onExit(_proc, exitCode, signalCode) {
 			unregisterFault();
@@ -290,7 +335,14 @@ export function createWorkerSubprocess<Outbound>(options: {
 	// path calls `terminate()` explicitly. Bun's test runner starves IPC for
 	// unref'd subprocesses, so keep it referenced only under tests.
 	if (!isBunTestRuntime() && options.unref !== false) proc.unref();
-	return { proc, inbound, errors, intentionalExit, stderrDrained: stderrDrained.promise };
+	return {
+		proc,
+		inbound,
+		errors,
+		intentionalExit,
+		stderrDrained: stderrDrained.promise,
+		disconnected: disconnected.promise,
+	};
 }
 
 /**
@@ -346,7 +398,10 @@ interface StderrCapture {
 function createStderrCapture(exitLabel: string): StderrCapture {
 	try {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-worker-stderr-"));
-		const fd = fs.openSync(path.join(dir, "stderr.log"), "w+");
+		const fd = fs.openSync(
+			path.join(dir, "stderr.log"),
+			fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_TRUNC,
+		);
 		const cleanupOnExit = (): void => cleanupStderrCapture({ target: fd, fd, dir, cleanupOnExit: null });
 		process.once("exit", cleanupOnExit);
 		return { target: fd, fd, dir, cleanupOnExit };

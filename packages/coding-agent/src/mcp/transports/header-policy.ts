@@ -12,6 +12,7 @@
  *    configured headers are attached only when the hop targets the configured
  *    origin. Method-changing redirects of non-GET requests are refused.
  */
+import { resolveExtraCa, withExtraCaInit } from "@oh-my-pi/pi-utils";
 
 /** Header buckets for one MCP HTTP request. */
 interface MCPHeaderSources {
@@ -92,6 +93,14 @@ export interface MCPFetchInit {
  * Non-locked servers keep the platform default redirect behavior. Locked
  * non-GET requests only follow 307/308 (method-preserving); a 301/302/303
  * redirect of a JSON-RPC POST is a connection error, never a silent GET.
+ *
+ * `timeout: false` keeps the runtime's socket idle timer out of the MCP timeout
+ * surface. MCP calls are long-poll shaped — a server may stay silent for as
+ * long as the work takes — and that timer would end such a wait even where the
+ * operator disabled MCP deadlines outright (`timeout: 0`,
+ * `OMP_MCP_TIMEOUT_MS=0`). Deadlines and cancellation stay with `init.signal`,
+ * which each transport composes from the configured per-request deadline,
+ * caller cancellation, and transport close.
  */
 export async function mcpFetch(
 	url: string,
@@ -99,8 +108,10 @@ export async function mcpFetch(
 	sources: MCPHeaderSources,
 	originLocked: boolean,
 ): Promise<Response> {
+	const extraCa = resolveExtraCa();
 	if (!originLocked) {
-		return fetch(url, { ...init, headers: mergeMCPHeaders(sources) });
+		const options = { ...init, headers: mergeMCPHeaders(sources), timeout: false };
+		return fetch(url, extraCa ? withExtraCaInit(options, extraCa) : options);
 	}
 
 	const configuredOrigin = new URL(url).origin;
@@ -108,7 +119,8 @@ export async function mcpFetch(
 	for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
 		const attachConfigured = new URL(currentUrl).origin === configuredOrigin;
 		const headers = mergeMCPHeaders(attachConfigured ? sources : { generated: sources.generated });
-		const response = await fetch(currentUrl, { ...init, headers, redirect: "manual" });
+		const options: RequestInit & { timeout: false } = { ...init, headers, redirect: "manual", timeout: false };
+		const response = await fetch(currentUrl, extraCa ? withExtraCaInit(options, extraCa) : options);
 		if (!REDIRECT_STATUSES[response.status]) return response;
 
 		const location = response.headers.get("Location");

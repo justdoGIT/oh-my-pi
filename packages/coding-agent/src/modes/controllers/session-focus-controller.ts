@@ -1,13 +1,44 @@
-import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID, type AgentRef, type RegistryEvent } from "../../registry/agent-registry";
-import type { AgentSession } from "../../session/agent-session";
-import { setTerminalTitleState } from "../../utils/title-generator";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { type AgentLifecycleApi, AgentLifecycleManager } from "../../registry/agent-lifecycle";
+import {
+	AgentRegistry,
+	type AgentRegistryApi,
+	MAIN_AGENT_ID,
+	type AgentRef,
+	type RegistryEvent,
+} from "../../registry/agent-registry";
+import { type AgentViewSession, isAgentViewSession } from "../../session/agent-session-handle";
+import type { AgentSessionEvent } from "../../session/agent-session";
+import { sameMessageContent, sessionMessagePersistenceKey } from "../../session/turn-persistence";
+import { setRunStatus } from "../../utils/run-status";
 import type { InteractiveModeContext } from "../types";
+
+/** Whether a rebuild's own reads of the session already show `event`, the `arrival`-th it emitted. */
+type ShownByRebuild = (event: AgentSessionEvent, arrival: number) => boolean;
+
+/**
+ * A message's identity candidate in both the rebuilt transcript and live events. An extension
+ * message (`custom` or `hookMessage`) is persisted as a custom entry under its own timestamp and
+ * rebuilt as a new `custom` object, so it is keyed by type and timestamp; the rest by persistence
+ * key, else the object. The key can collide for distinct messages minted in the same millisecond,
+ * so {@link replayedIncludes} confirms a hit by content, mirroring the persistence path.
+ */
+function transcriptKey(message: AgentMessage): unknown {
+	if (message.role === "custom" || message.role === "hookMessage")
+		return `custom:${message.customType}:${message.timestamp}`;
+	return sessionMessagePersistenceKey(message) ?? message;
+}
+
+/** Whether the rebuilt transcript (grouped by {@link transcriptKey}) already shows this exact message. */
+function replayedIncludes(replayed: ReadonlyMap<unknown, readonly AgentMessage[]>, message: AgentMessage): boolean {
+	return replayed.get(transcriptKey(message))?.some(candidate => sameMessageContent(candidate, message)) ?? false;
+}
 
 /**
  * Pick the most recently active focusable subagent. Advisors are read-only
- * transcripts and aborted agents are terminal, so neither is focusable; the
- * main session is the view itself, not a focus target. A focused caller passes
+ * transcripts and killed agents wait for an explicit revive, so neither is
+ * cycled to; the main session is the view itself, not a focus target. A focused caller passes
  * its id to cycle to the next-most-recent agent (wrapping), so repeated
  * presses walk the roster instead of sticking on the newest row.
  */
@@ -39,7 +70,8 @@ export function pickRecentFocusableAgentId(refs: readonly AgentRef[], currentId?
 export class SessionFocusController {
 	#focusedAgentId: string | undefined;
 	/** Session currently attached while focused; undefined when unfocused. */
-	#attachedSession: AgentSession | undefined;
+	#attachedSession: AgentViewSession | undefined;
+	#focusAttachment: Promise<void> | undefined;
 	#registryUnsubscribe: (() => void) | undefined;
 	#attachGeneration = 0;
 	/** Monotonic focus-request id: a request that resolves after a newer one drops instead of clobbering the view. */
@@ -47,8 +79,8 @@ export class SessionFocusController {
 
 	constructor(
 		private ctx: InteractiveModeContext,
-		private registry: AgentRegistry = AgentRegistry.global(),
-		private lifecycle: () => AgentLifecycleManager = () => AgentLifecycleManager.global(),
+		private registry: AgentRegistryApi = AgentRegistry.global(),
+		private lifecycle: () => AgentLifecycleApi = () => AgentLifecycleManager.global(),
 	) {}
 
 	get focusedAgentId(): string | undefined {
@@ -56,7 +88,7 @@ export class SessionFocusController {
 	}
 
 	/** Focused live session, undefined when unfocused. */
-	get target(): AgentSession | undefined {
+	get target(): AgentViewSession | undefined {
 		return this.#attachedSession;
 	}
 	/** Focus the main view on an agent's live session. Throws an Error with a user-displayable message. */
@@ -64,9 +96,15 @@ export class SessionFocusController {
 		if (this.ctx.collabGuest) throw new Error("Viewing agents is unavailable in a collab session.");
 		if (id === MAIN_AGENT_ID) return this.unfocus();
 		const request = ++this.#focusRequestSeq;
-		let session: AgentSession;
+		let session: AgentViewSession;
 		try {
-			session = await this.lifecycle().ensureLive(id);
+			const live = await this.lifecycle().ensureLive(id);
+			// Main-thread handles are local sessions or mirrors of worker-homed ones, both viewable; only a
+			// worker's peer handle (a session homed on another thread, seen from a worker) is not.
+			if (!isAgentViewSession(live)) {
+				throw new Error(`Agent ${id} is homed on another thread and can only be viewed from the main thread.`);
+			}
+			session = live;
 		} catch (error) {
 			// A newer request owns the view now: a stale revive failure must
 			// not surface after the winner already focused.
@@ -77,24 +115,26 @@ export class SessionFocusController {
 		// still reviving) wins: drop the stale completion instead of letting
 		// the slower revive replace the view.
 		if (request !== this.#focusRequestSeq) return;
-		// Doom in-flight attachments from older requests now that this one is
-		// known usable — not at request time, so a newer revival that fails
-		// leaves the current attachment undisturbed instead of half torn down.
-		++this.#attachGeneration;
-		this.#focusedAgentId = id;
-		this.#attachedSession = session;
-		this.#registryUnsubscribe ??= this.registry.onChange(e => this.#onRegistryEvent(e));
-		let attached = false;
+		const sameSession = id === this.#focusedAgentId && session === this.#attachedSession;
+		let attachment = this.#focusAttachment;
+		// Reuse an in-flight rebuild without discarding unpersisted tool cards.
+		if (sameSession) {
+			if (!attachment) return;
+		} else {
+			++this.#attachGeneration;
+			this.#focusedAgentId = id;
+			this.#attachedSession = session;
+			this.#registryUnsubscribe ??= this.registry.onChange(e => this.#onRegistryEvent(e));
+			attachment = this.#attach(session);
+			this.#focusAttachment = attachment;
+		}
 		try {
-			attached = await this.#attach(session);
+			await attachment;
 		} catch (error) {
-			// Same supersede rule as the revive above: only the current
-			// request may surface attachment failures.
 			if (request !== this.#focusRequestSeq) return;
 			throw error;
-		}
-		if (attached && this.#focusedAgentId === id && this.#attachedSession === session) {
-			this.ctx.showStatus(`Viewing agent ${id} — Esc returns to main, ←← hops to parent`);
+		} finally {
+			if (this.#focusAttachment === attachment) this.#focusAttachment = undefined;
 		}
 	}
 
@@ -126,11 +166,11 @@ export class SessionFocusController {
 		if (!this.#focusedAgentId) return;
 		this.#focusedAgentId = undefined;
 		this.#attachedSession = undefined;
-		const attached = await this.#attach(this.ctx.session);
-		if (attached && this.#focusedAgentId === undefined) this.ctx.showStatus("Returned to main session");
+		await this.#attach(this.ctx.session);
 	}
 
 	dispose(): void {
+		this.ctx.syncIdleMaintenanceView(null);
 		// A pending revive — or a running attachment — must not land during
 		// teardown: invalidate both generations the way leave-main does.
 		this.#focusRequestSeq++;
@@ -146,6 +186,12 @@ export class SessionFocusController {
 	invalidatePendingFocus(): void {
 		this.#focusRequestSeq++;
 	}
+	#runSerialized(generation: number, run: () => Promise<void>): Promise<void> {
+		return this.ctx.eventController.runSerialized(async () => {
+			if (generation !== this.#attachGeneration) return;
+			await run();
+		});
+	}
 
 	#onRegistryEvent(event: RegistryEvent): void {
 		if (event.ref.id !== this.#focusedAgentId) return;
@@ -158,67 +204,175 @@ export class SessionFocusController {
 	}
 
 	/** Retarget core, both directions: swap subscription, transcript, and status line onto `target`. */
-	async #attach(target: AgentSession): Promise<boolean> {
+	async #attach(target: AgentViewSession): Promise<void> {
 		const generation = ++this.#attachGeneration;
-		this.ctx.unsubscribe?.();
-		this.ctx.clearTransientSessionUi();
-		this.ctx.eventController.resetTranscriptAnchors();
-		// Orphan-delta guard: when attaching mid-turn the message_start for the
-		// in-flight assistant message predates the attach. message_update carries
-		// the full accumulating message, so synthesize the missing start before
-		// the first orphaned update; every other handler is tolerant of unknown
-		// anchors (guarded by streamingComponent/pendingTools lookups).
-		let assistantStreamSynced = false;
-		this.ctx.unsubscribe = target.subscribe(async event => {
-			if (event.type === "message_start" && event.message.role === "assistant") {
-				assistantStreamSynced = true;
-			} else if (event.type === "message_update" && event.message.role === "assistant" && !assistantStreamSynced) {
-				assistantStreamSynced = true;
-				await this.ctx.eventController.handleEvent({ type: "message_start", message: event.message });
+		this.ctx.syncIdleMaintenanceView(target);
+		try {
+			this.ctx.unsubscribe?.();
+			this.ctx.clearTransientSessionUi({ viewOnly: true });
+			this.ctx.eventController.resetTranscriptAnchors();
+			let assistantStreamSynced = false;
+			const restoreAssistant = async (message: AssistantMessage): Promise<void> => {
+				if (generation !== this.#attachGeneration) return;
+				if (!assistantStreamSynced) {
+					assistantStreamSynced = true;
+					await this.ctx.eventController.handleEvent({ type: "message_start", message });
+					if (generation !== this.#attachGeneration) return;
+				}
+				await this.ctx.eventController.syncAssistantMessage(message);
+				if (generation === this.#attachGeneration) this.ctx.eventController.restorePendingToolResults();
+			};
+			// Events are numbered as they arrive and queued behind the rebuild, which is queued in
+			// this same tick: no handler runs in the middle of it, and it drops each event its own
+			// reads of `target` already show, so nothing is drawn twice or into a replaced chat.
+			let arrivals = 0;
+			let shown: ShownByRebuild | undefined;
+			this.ctx.unsubscribe = target.subscribe(event => {
+				const arrival = ++arrivals;
+				const streamMessage = target.agent.state.streamMessage;
+				return this.#runSerialized(generation, async () => {
+					if (shown?.(event, arrival)) return;
+					if (event.type === "message_start" && event.message.role === "assistant") {
+						assistantStreamSynced = true;
+					} else if (
+						(event.type === "message_update" || event.type === "message_end") &&
+						event.message.role === "assistant" &&
+						!assistantStreamSynced
+					) {
+						if (event.type === "message_end") await restoreAssistant(event.message);
+						else {
+							assistantStreamSynced = true;
+							// A replay `start` opens the message itself via the restart path.
+							if (event.assistantMessageEvent?.type !== "start") {
+								await this.ctx.eventController.handleEvent({ type: "message_start", message: event.message });
+							}
+						}
+						if (generation !== this.#attachGeneration) return;
+					} else if (
+						event.type === "tool_execution_start" &&
+						!assistantStreamSynced &&
+						streamMessage?.role === "assistant"
+					) {
+						await restoreAssistant(streamMessage);
+						if (generation !== this.#attachGeneration) return;
+					}
+					if (event.type === "message_end" && event.message.role === "assistant") assistantStreamSynced = false;
+					await this.ctx.eventController.handleEvent(event);
+				});
+			});
+			let restored: Promise<void> | undefined;
+			await this.#runSerialized(generation, async () => {
+				const rebuilt = await this.#rebuild(target, generation, () => arrivals, restoreAssistant);
+				shown = rebuilt?.shown;
+				restored = rebuilt?.restored;
+			});
+			await restored;
+			if (generation !== this.#attachGeneration) return;
+			await this.ctx.reloadTodos(target);
+			if (generation !== this.#attachGeneration) return;
+			this.ctx.updatePendingMessagesDisplay();
+			this.ctx.updateEditorBorderColor();
+			this.ctx.ui.requestRender();
+		} catch (error) {
+			if (generation === this.#attachGeneration) {
+				this.#focusedAgentId = undefined;
+				this.#attachedSession = undefined;
+				// Keep a failed main replay subscribed; never recursively recover it.
+				if (target !== this.ctx.session) {
+					try {
+						await this.#attach(this.ctx.session);
+					} catch (recoveryError) {
+						throw new AggregateError(
+							[error, recoveryError],
+							"Focus attachment and main-session recovery both failed",
+						);
+					}
+				}
 			}
-			await this.ctx.eventController.handleEvent(event);
-		});
-		// Events emitted while another session was focused had no TUI listener,
-		// but their message_end handlers still persist authoritative transcript
-		// state asynchronously. Subscribe first, then settle the persistence
-		// already in flight at this boundary before replay: an already-emitted
-		// tool completion becomes a persisted toolResult, so the rebuild can't
-		// resurrect a result-less toolCall whose only completion was lost during
-		// the blackout (#9816). Later events reach the newly installed listener.
-		await target.settleInFlightMessagePersistence();
-		if (generation !== this.#attachGeneration) return false;
-		this.ctx.statusLine.setSession(target, this.#focusedAgentId);
-		await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
-		if (generation !== this.#attachGeneration) return false;
-		// Partial tool results are display events, not persisted messages. Replay
-		// each target's latest snapshot after rebuilding so focus navigation does
-		// not collapse a live task board back to its bare call arguments (#10446).
-		for (const event of target.activeToolExecutionUpdates()) {
-			await this.ctx.eventController.handleEvent(event);
-			if (generation !== this.#attachGeneration) return false;
+			throw error;
 		}
-		// Retarget the sticky Todo HUD too. While a subagent is focused the main
-		// session's `todo` completions never reach this controller; returning to
-		// main must therefore reload its current state instead of retaining the
-		// pre-focus snapshot. Passing `target` also restores a focused subagent's
-		// own todos rather than overwriting them with the main session's list.
-		await this.ctx.reloadTodos(target);
-		if (generation !== this.#attachGeneration) return false;
-		// Rebuild the pending steering/follow-up block the same way. clearTransientSessionUi()
-		// disposed pendingMessagesContainer's children, but nothing re-derived them, so returning
-		// from a focused agent left the queue intact yet permanently unpainted until an unrelated
-		// caller repainted it (#11379). Reads viewSession (target ?? main), so this restores main's
-		// queue on unfocus and shows a focused subagent's own queue on focus.
-		this.ctx.updatePendingMessagesDisplay();
-		// Sync the run-state title to the attached target: a streaming target has no
-		// agent_start incoming, so arm the loader/working title manually; an idle
-		// target would otherwise inherit the previous session's stuck spinner, so
-		// reset it to idle (agent_end teardown already ran via clearTransientSessionUi).
+	}
+
+	/**
+	 * Rebuild the view of `target` from its own state (run status, transcript, buffered tool
+	 * results) as one run of the serialized dispatch chain, and queue the restore of its live reply
+	 * and running tools (`restored`) behind the events that arrived by then, so an older reply
+	 * ending in between is drawn first. `shown` says which events, numbered by `arrivals` as they
+	 * came in, those reads already show. Undefined when a newer attachment took over.
+	 */
+	async #rebuild(
+		target: AgentViewSession,
+		generation: number,
+		arrivals: () => number,
+		restoreAssistant: (message: AssistantMessage) => Promise<void>,
+	): Promise<{ shown: ShownByRebuild; restored: Promise<void> } | undefined> {
+		// A tool result emitted while nothing listened must be in the transcript rebuilt below.
+		await target.settleInFlightMessagePersistence();
+		if (generation !== this.#attachGeneration) return undefined;
+		this.ctx.statusLine.setSession(target, this.#focusedAgentId);
+		// Reset run bookkeeping before replay populates pending tool handles.
+		const statusRead = arrivals();
 		if (target.isStreaming) await this.ctx.eventController.handleEvent({ type: "agent_start" });
-		else setTerminalTitleState("idle");
-		if (generation !== this.#attachGeneration) return false;
-		this.ctx.updateEditorBorderColor();
-		this.ctx.ui.requestRender();
-		return true;
+		else {
+			setRunStatus({ state: "idle" });
+			this.ctx.eventController.markViewIdle();
+		}
+		if (generation !== this.#attachGeneration) return undefined;
+		const replayed = new Map<unknown, AgentMessage[]>();
+		const resultTools = new Set<string>();
+		await this.ctx.renderInitialMessages({
+			clearTerminalHistory: true,
+			onCommit: context => {
+				for (const message of context.messages) {
+					const key = transcriptKey(message);
+					const colliding = replayed.get(key);
+					if (colliding) colliding.push(message);
+					else replayed.set(key, [message]);
+					if (message.role === "toolResult") resultTools.add(message.toolCallId);
+				}
+			},
+		});
+		if (generation !== this.#attachGeneration) return undefined;
+		this.ctx.eventController.restorePendingToolResults();
+
+		// Read and queued in one tick: every event up to `liveRead` runs before the restore, every
+		// later one after it.
+		const liveRead = arrivals();
+		const live = target.agent.state.streamMessage;
+		const running = target.activeToolExecutionUpdates();
+		const restored = this.#runSerialized(generation, async () => {
+			if (live?.role === "assistant") await restoreAssistant(live);
+			for (const event of running) {
+				if (generation !== this.#attachGeneration) return;
+				await this.ctx.eventController.handleEvent(event);
+			}
+		});
+		const shown: ShownByRebuild = (event, arrival) => {
+			switch (event.type) {
+				case "agent_start":
+					// The status read started this run, or found it already over.
+					return arrival <= statusRead;
+				case "tool_execution_start":
+					// The replay drew this call with its result. Its updates and end still count (a
+					// detached task's persisted result says "running" and its job keeps reporting), as
+					// does a later retry of the same call id.
+					return arrival <= liveRead && resultTools.has(event.toolCallId);
+				case "tool_execution_update":
+					// `running` holds each running tool's newest update.
+					return arrival <= liveRead;
+				case "message_start":
+				case "message_update":
+				case "message_end":
+					// The replay drew this message as persisted. A reply still streaming at `liveRead`
+					// is `live`, drawn by the restore; one that ended by then is drawn by its own end.
+					return (
+						replayedIncludes(replayed, event.message) ||
+						(event.message.role === "assistant" && event.type !== "message_end" && arrival <= liveRead)
+					);
+				default:
+					return false;
+			}
+		};
+		return { shown, restored };
 	}
 }
