@@ -2822,6 +2822,13 @@ describe("filterAvailableModelsByEnabledPatterns", () => {
 		expect(result[0].provider).toBe("openrouter");
 	});
 
+	test("evaluates provider wildcards across nested model ids", () => {
+		const openRouterModels = mockOpenRouterModels as Model[];
+		const result = filterAvailableModelsByEnabledPatterns(openRouterModels, ["openrouter/*"]);
+		expect(result).toHaveLength(openRouterModels.length);
+		expect(result.every(model => model.provider === "openrouter")).toBe(true);
+	});
+
 	test("evaluates glob patterns against provider/modelId", () => {
 		const result = filterAvailableModelsByEnabledPatterns(models, ["anthropic/*"]);
 		expect(result).toHaveLength(1);

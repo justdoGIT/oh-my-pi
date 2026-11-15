@@ -132,7 +132,14 @@ export interface ScopedModel {
 }
 
 function matchingGlobModels(pattern: string, availableModels: readonly Model<Api>[]): Model<Api>[] {
-	const glob = new Bun.Glob(pattern.toLowerCase());
+	const normalizedPattern = pattern.toLowerCase();
+	const providerWildcard = /^([^/]+)\/\*$/.exec(normalizedPattern);
+	if (providerWildcard) {
+		const provider = providerWildcard[1]!;
+		return availableModels.filter(model => model.provider.toLowerCase() === provider);
+	}
+
+	const glob = new Bun.Glob(normalizedPattern);
 	return availableModels.filter(model => {
 		const fullId = `${model.provider}/${model.id}`;
 		return glob.match(fullId.toLowerCase()) || glob.match(model.id.toLowerCase());
