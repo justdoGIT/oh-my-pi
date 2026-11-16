@@ -2,9 +2,11 @@
 
 ## [Unreleased]
 
+## [18.20.1] - 2026-11-14
+
 ### Fixed
 
-- Context estimates no longer price a turn's thinking text on routes that strip reasoning history from their requests (OpenRouter's Anthropic and Muse routes, opencode's Muse routes, Factory's Muse Spark), which do not send it; the text stays priced where the request rebuilds the stripped reasoning item for a tool call and carries it ([#18489](https://github.com/can1357/oh-my-pi/pull/18489) by [@yuzu-octopus](https://github.com/yuzu-octopus))
+- Corrected context cost estimates for requests that omit reasoning history, so billing estimates now include thinking text only when it is sent or reconstructed for a tool call.
 
 ## [18.20.0] - 2026-11-12
 
