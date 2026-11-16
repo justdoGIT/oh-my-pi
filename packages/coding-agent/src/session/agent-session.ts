@@ -314,6 +314,7 @@ import type {
 	AsyncJobTree,
 	CommandMetadataChangedListener,
 	ContextUsageBreakdown,
+	DequeuedMessage,
 	DroppedPrompt,
 	EphemeralTurnOptions,
 	EphemeralTurnResult,
@@ -1149,7 +1150,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#planReferencePath = "local://PLAN.md";
 	#planReferenceApproved = false;
 	#clientBridge: ClientBridge | undefined;
-	#allowAcpAgentInitiatedTurns = false;
 	/** Session file created by this session's `/move`; removed on dispose if it stayed empty. */
 	#movedFromEmptySessionFile?: string;
 
@@ -2552,7 +2552,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
-				if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
+				if (this.#clientBridge?.deferAgentInitiatedTurns) {
 					this.#recordWithoutTurn(messages);
 					return;
 				}
@@ -2879,7 +2879,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			onSseEvent: this.#onSseEvent,
 			isDisposed: () => this.#isDisposed,
 			abortInProgress: () => this.#abortInProgress,
-			allowAgentInitiatedTurns: () => this.#allowAcpAgentInitiatedTurns,
 			planModeState: () => this.#planModeState,
 			clientBridge: () => this.#clientBridge,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
@@ -7421,21 +7420,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#advisors.waitForAdvisorCatchup(timeoutMs, options);
 	}
 
+	/**
+	 * Drain this owner's queued async deliveries; `true` when the drain made
+	 * progress. Whether a drained result starts a turn stays with the bridge's
+	 * live `deferAgentInitiatedTurns`: only an open client prompt admits one, so
+	 * a drain that outlives its prompt folds results into the next prompt.
+	 */
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
 		const manager = this.#asyncJobManager;
 		if (!manager) return false;
 		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
 		const before = manager.getDeliveryState(ownerFilter);
 		if (before.queued === 0 && !before.delivering) return false;
-		const previousAllowAcpAgentInitiatedTurns = this.#allowAcpAgentInitiatedTurns;
-		this.#allowAcpAgentInitiatedTurns = true;
-		try {
-			const drained = await manager.drainDeliveries({ timeoutMs: options?.timeoutMs, filter: ownerFilter });
-			const after = manager.getDeliveryState(ownerFilter);
-			return drained && (before.queued !== after.queued || before.delivering !== after.delivering);
-		} finally {
-			this.#allowAcpAgentInitiatedTurns = previousAllowAcpAgentInitiatedTurns;
-		}
+		const drained = await manager.drainDeliveries({ timeoutMs: options?.timeoutMs, filter: ownerFilter });
+		const after = manager.getDeliveryState(ownerFilter);
+		return drained && (before.queued !== after.queued || before.delivering !== after.delivering);
 	}
 
 	/**
@@ -10587,16 +10586,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// that bracket continues under the owning prompt — the client sees
 		// and can cancel it. Autonomous brackets (IRC wakes, idle injections,
 		// scheduler continuations) do not count: a drain there would be an
-		// autonomous run the client can neither see nor cancel. Explicit
-		// agent-initiated deliveries re-enable the drain via
-		// #allowAcpAgentInitiatedTurns. Inside a client bracket the ordinary
-		// gates below still apply (not streaming, user-interrupt suppression,
-		// provider-valid tail for follow-up-only resumes).
-		if (
-			this.#clientBridge?.deferAgentInitiatedTurns === true &&
-			!this.#allowAcpAgentInitiatedTurns &&
-			this.#clientPromptInFlightCount === 0
-		) {
+		// autonomous run the client can neither see nor cancel. Inside a client
+		// bracket the ordinary gates below still apply (not streaming,
+		// user-interrupt suppression, provider-valid tail for follow-up-only
+		// resumes).
+		if (this.#clientBridge?.deferAgentInitiatedTurns === true && this.#clientPromptInFlightCount === 0) {
 			return false;
 		}
 		if (this.isStreaming) return false;
@@ -11020,7 +11014,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		if (options?.deliverAs === "nextTurn") {
 			if (options?.triggerTurn) {
-				if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
+				if (this.#clientBridge?.deferAgentInitiatedTurns) {
 					this.#queueHiddenNextTurnMessage(normalizedAppMessage, false);
 					return false;
 				}
@@ -11060,7 +11054,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#recordWithoutTurn([normalizedAppMessage]);
 				return false;
 			}
-			if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
+			if (this.#clientBridge?.deferAgentInitiatedTurns) {
 				this.#queueHiddenNextTurnMessage(normalizedAppMessage, false);
 				return false;
 			}
@@ -11080,7 +11074,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 
 		if (options?.triggerTurn) {
-			if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
+			if (this.#clientBridge?.deferAgentInitiatedTurns) {
 				this.#queueHiddenNextTurnMessage(normalizedAppMessage, false);
 				return false;
 			}
@@ -11420,11 +11414,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * Pop the last queued message (steering first, then follow-up).
+	 * Pop the last queued message (steering first, then follow-up), tagged with its queue.
 	 * Used by dequeue keybinding to restore messages to editor one at a time.
 	 * Steps over agent-authored queued messages (advisor cards, hidden/internal steers).
 	 */
-	popLastQueuedMessage(): RestoredQueuedMessage | undefined {
+	popLastQueuedMessage(): DequeuedMessage | undefined {
 		const steering = this.agent.peekSteeringQueue();
 		const followUp = this.agent.peekFollowUpQueue();
 		const lastUserIndex = (queue: readonly AgentMessage[]): number => {
@@ -11438,14 +11432,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const removed = steering[fromSteer];
 			this.agent.replaceQueues(this.#withoutQueuedUserMessage(steering, fromSteer), followUp.slice());
 			this.#reconcileQueuedMessageDrain();
-			return toRestoredQueuedMessage(removed);
+			return { ...toRestoredQueuedMessage(removed), queue: "steering" };
 		}
 		const fromFollowUp = lastUserIndex(followUp);
 		if (fromFollowUp >= 0) {
 			const removed = followUp[fromFollowUp];
 			this.agent.replaceQueues(steering.slice(), this.#withoutQueuedUserMessage(followUp, fromFollowUp));
 			this.#reconcileQueuedMessageDrain();
-			return toRestoredQueuedMessage(removed);
+			return { ...toRestoredQueuedMessage(removed), queue: "followUp" };
 		}
 		return undefined;
 	}
@@ -14065,8 +14059,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * `retry.modelFallback` on) instead keeps its current model and reports a
 	 * warning. Reloading the current session keeps the current model.
 	 *
-	 * With `onCwdChange`, a target whose recorded directory is missing or cannot be
-	 * entered throws `Cannot resume session: …` and the current session stays active.
+	 * A target whose recorded directory is missing or cannot be entered resumes in the
+	 * current cwd (the session manager keeps it there, runtime-only until relocated);
+	 * callers can detect this by comparing `getRecordedCwd()` with `getCwd()`.
 	 * @returns true if switch completed, false if cancelled by hook or cwd change
 	 */
 	async switchSession(
@@ -14210,12 +14205,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						if (!(await options.onCwdChange(newCwd, previousSessionState.cwd))) {
 							throw SESSION_CWD_CHANGE_REJECTED;
 						}
-					} else if (path.resolve(recordedCwd) !== path.resolve(previousSessionState.cwd)) {
-						// setSessionFile kept the current cwd because the recorded one cannot be
-						// entered; resuming here would point tools at the wrong project.
-						throw new Error(
-							`Cannot resume session: its directory ${recordedCwd} is missing or cannot be entered`,
-						);
 					}
 				}
 			}
